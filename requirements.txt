@@ -1,0 +1,11 @@
+hatchet-sdk>=0.41.0
+nebius>=0.2.0
+boto3>=1.34.0
+transformers>=4.40.0
+accelerate>=0.29.0
+sentencepiece>=0.2.0
+torch>=2.2.0
+moviepy>=1.0.3
+requests>=2.31.0
+pydantic-settings>=2.2.0
+python-dotenv>=1.0.0
