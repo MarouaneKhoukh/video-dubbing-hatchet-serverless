@@ -107,20 +107,6 @@ flowchart TB
 ```
 
 
-## Screenshots
-
-Hatchet gives a trace-level view of the full workflow run. In this run, the
-pipeline completed end to end after moving through extraction, transcription,
-translation, TTS, and remuxing.
-
-![Hatchet traces for a completed video dubbing workflow](docs/screenshots/hatchet-workflow-traces.png)
-
-Nebius shows the infrastructure-level view behind those workflow steps. The
-failed preemptible TTS jobs are followed by later successful replacement jobs,
-which is the retry pattern Hatchet coordinates for the pipeline.
-
-![Nebius Jobs showing failed and completed preemptible TTS jobs](docs/screenshots/nebius-preemptible-jobs.png)
-
 ## Repository Layout
 
 ```text
@@ -249,6 +235,20 @@ my-video_first-run_dubbed.mp4
 Monitor runs in the Hatchet dashboard at https://cloud.onhatchet.run. The
 **Traces** tab shows a Gantt chart of all pipeline steps.
 
+## Screenshots
+
+After a run starts, Hatchet shows the workflow timeline in the **Traces** tab.
+This screenshot shows a completed dubbing run after extraction, transcription,
+translation, TTS, and remuxing all finished.
+
+![Hatchet traces for a completed video dubbing workflow](docs/screenshots/hatchet-workflow-traces.png)
+
+The Nebius Jobs view shows what happened underneath the Hatchet workflow. Some
+TTS jobs were launched on preemptible GPU capacity and failed when that capacity
+was interrupted. Hatchet treated those failures as retryable, launched new
+preemptible jobs, and the later replacement jobs completed successfully.
+
+![Nebius Jobs showing failed and completed preemptible TTS jobs](docs/screenshots/nebius-preemptible-jobs.png)
 
 ## Known Limitations and Workarounds
 
