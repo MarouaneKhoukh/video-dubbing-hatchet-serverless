@@ -107,6 +107,20 @@ flowchart TB
 ```
 
 
+## Screenshots
+
+Hatchet gives a trace-level view of the full workflow run. In this run, the
+pipeline completed end to end after moving through extraction, transcription,
+translation, TTS, and remuxing.
+
+![Hatchet traces for a completed video dubbing workflow](docs/screenshots/hatchet-workflow-traces.png)
+
+Nebius shows the infrastructure-level view behind those workflow steps. The
+failed preemptible TTS jobs are followed by later successful replacement jobs,
+which is the retry pattern Hatchet coordinates for the pipeline.
+
+![Nebius Jobs showing failed and completed preemptible TTS jobs](docs/screenshots/nebius-preemptible-jobs.png)
+
 ## Repository Layout
 
 ```text
