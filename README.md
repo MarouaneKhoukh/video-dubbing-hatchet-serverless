@@ -80,6 +80,48 @@ Nebius Object Storage (data bus — video, audio, transcript, output)
         +-- ffmpeg CPU job        (remux video)
 ```
 
+```mermaid
+flowchart TB
+    subgraph local["🖥️ Your Machine (orchestrates only)"]
+        worker["Hatchet Worker\nworker.py"]
+        trigger["trigger.py /\nbatch_trigger.py"]
+    end
+
+    subgraph hatchet["☁️ Hatchet Cloud"]
+        dashboard["Dashboard\nRetries · Traces · Logs"]
+    end
+
+    subgraph storage["🗄️ Nebius Object Storage"]
+        bucket["workshop bucket\nvideo · audio · transcript · output"]
+    end
+
+    subgraph nebius["⚡ Nebius Serverless Jobs"]
+        ffmpeg1["ffmpeg\nCPU job\nextract audio"]
+        whisper["faster-whisper\nGPU · L40S preemptible\ntranscribe"]
+        translate["MADLAD-400\nCPU job\ntranslate"]
+        tts["Coqui TTS\nGPU · L40S preemptible\nsynthesize"]
+        ffmpeg2["ffmpeg\nCPU job\nremux video"]
+    end
+
+    trigger -->|"trigger run"| worker
+    worker <-->|"orchestrates"| dashboard
+    worker -->|"creates jobs"| nebius
+    storage <-->|"/data mount"| nebius
+    
+    ffmpeg1 --> whisper --> translate --> tts --> ffmpeg2
+
+    style local fill:#f0eeff,stroke:#7F77DD,color:#3C3489
+    style hatchet fill:#eef9f5,stroke:#1D9E75,color:#0F6E56
+    style storage fill:#eef9f5,stroke:#1D9E75,color:#0F6E56
+    style nebius fill:#fff4ee,stroke:#D85A30,color:#993C1D
+    style ffmpeg1 fill:#faeeda,stroke:#BA7517,color:#633806
+    style whisper fill:#faece7,stroke:#D85A30,color:#993C1D
+    style translate fill:#faeeda,stroke:#BA7517,color:#633806
+    style tts fill:#faece7,stroke:#D85A30,color:#993C1D
+    style ffmpeg2 fill:#faeeda,stroke:#BA7517,color:#633806
+```
+
+
 ## Repository Layout
 
 ```text
