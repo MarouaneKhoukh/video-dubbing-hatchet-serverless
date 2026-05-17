@@ -16,185 +16,168 @@ workflow then coordinates a sequence of jobs:
 
 ```text
 input video in object storage
-  -> extract audio with ffmpeg
-  -> transcribe speech with Whisper
-  -> translate transcript with MADLAD-400
-  -> synthesize dubbed speech with Coqui TTS
-  -> merge the original video with the dubbed audio
+  -> extract audio with ffmpeg          (Nebius CPU job)
+  -> transcribe speech with Whisper     (Nebius GPU job, preemptible)
+  -> translate transcript with MADLAD-400 (Nebius CPU job)
+  -> synthesize dubbed speech with Coqui TTS (Nebius GPU job, preemptible)
+  -> merge video with dubbed audio      (Nebius CPU job)
   -> output dubbed video in object storage
 ```
 
-Each stage is isolated. CPU-friendly media steps run as CPU jobs, while Whisper
-and text-to-speech run as GPU jobs. The video, transcript, translated text, and
-generated audio are passed between stages through object storage instead of
-through the local machine.
+Your local machine only runs the Hatchet worker. It never touches the video
+data. Everything passes through object storage.
 
 ## Why Use Hatchet
 
 Video dubbing is a workflow problem, not just a model invocation problem. A
-single run may involve multiple long-running steps, different container images,
+single run involves multiple long-running steps, different container images,
 GPU scheduling, cloud job polling, storage checks, and retries.
 
-Hatchet is used here as the workflow engine because it gives the pipeline:
+Hatchet is used here because it gives the pipeline:
 
 - durable execution state for each dubbing run
-- explicit task dependencies between media, transcription, translation, and TTS
-- automatic retries when a job fails or a GPU worker is interrupted
-- logs and visibility for each stage of the pipeline
-- a clean boundary between orchestration logic and the actual AI containers
+- explicit task dependencies between stages
+- automatic retries when a GPU job is preempted
+- a clean visual timeline in the Traces view
+- logs and visibility for every stage
 
-In this repo, the Hatchet worker does not perform the heavy computation itself.
-It submits jobs to Nebius, waits for them to complete, validates that expected
-artifacts exist in storage, and then moves the workflow to the next step.
+The Hatchet worker does not perform the heavy computation itself. It submits
+jobs to Nebius, waits for them to complete, validates that expected artifacts
+exist in storage, and then moves the workflow to the next step.
 
 ## Why Use Nebius Serverless
 
-Video dubbing combines workloads with very different compute needs. ffmpeg can
-run well on CPU, while Whisper and TTS benefit from GPUs. Keeping all of that
-capacity running all the time is wasteful, especially when dubbing jobs arrive
-irregularly.
+Video dubbing combines workloads with very different compute needs. ffmpeg runs
+well on CPU, while Whisper and TTS benefit from GPUs. Keeping all of that
+capacity running all the time is wasteful.
 
-Nebius Serverless Jobs are used because they let the pipeline run each stage on
-the right kind of infrastructure:
+Nebius Serverless Jobs let the pipeline run each stage on the right infrastructure:
 
-- CPU jobs for ffmpeg extraction, translation, and remuxing
-- GPU jobs for Whisper transcription and Coqui TTS synthesis
-- preemptible GPU capacity for cost-sensitive AI stages
+- CPU jobs for ffmpeg and translation
+- GPU jobs on preemptible L40S for Whisper and TTS
 - mounted object storage so every container sees the same `/data` workspace
 - isolated, reproducible execution through Docker images
 
-The workflow can treat a preempted GPU job as a retryable failure. When Nebius
-reports the job as failed or interrupted, the helper code raises an error and
-Hatchet retries the task on a new job.
+When a preemptible GPU is reclaimed, Nebius sets the job state to `ERROR`. The
+pipeline detects this and raises a `RuntimeError`, which Hatchet catches and
+retries automatically on a new GPU.
 
 ## Architecture
 
-The main workflow is defined in `pipeline/workflow.py`.
-
 ```text
-Hatchet event: dubbing:start
+Hatchet Cloud (orchestration + dashboard)
         |
         v
-extract_audio
-  Nebius CPU job, ffmpeg
+Your machine (Hatchet worker, orchestrates only)
         |
         v
-transcribe_whisper
-  Nebius GPU job, faster-whisper
+Nebius Object Storage (data bus — video, audio, transcript, output)
         |
-        v
-translate_text_step
-  Nebius CPU job, MADLAD-400
-        |
-        v
-synthesize_tts
-  Nebius GPU job, Coqui TTS
-        |
-        v
-remux_video
-  Nebius CPU job, ffmpeg
+        +-- ffmpeg CPU job        (extract audio)
+        +-- Whisper GPU job       (transcribe, preemptible L40S)
+        +-- MADLAD-400 CPU job    (translate)
+        +-- Coqui TTS GPU job     (synthesize, preemptible L40S)
+        +-- ffmpeg CPU job        (remux video)
 ```
-
-The local worker is responsible for orchestration only. The actual video and
-audio files stay in object storage and are mounted into Nebius jobs at `/data`.
 
 ## Repository Layout
 
 ```text
 .
 |-- worker.py                    # Starts the Hatchet worker
-|-- trigger.py                   # Starts a dubbing workflow run
-|-- batch_trigger.py             # Helper for triggering multiple runs
-|-- docker-compose.yml           # Local Hatchet stack
+|-- trigger.py                   # Triggers a single dubbing run
+|-- batch_trigger.py             # Triggers multiple runs staggered over time
 |-- requirements.txt             # Python dependencies for the worker
+|-- .env.example                 # Environment variable template
 |-- pipeline/
 |   |-- workflow.py              # Hatchet workflow and task definitions
 |   |-- nebius.py                # Nebius job creation and polling helpers
 |   |-- config.py                # Environment-based settings
-|   `-- local.py                 # Object storage and local utility helpers
+|   `-- local.py                 # Object storage helpers
 `-- containers/
-    |-- whisper/                 # Whisper transcription image
+    |-- whisper/                 # faster-whisper transcription image
     |-- translate/               # MADLAD-400 translation image
     `-- tts/                     # Coqui TTS synthesis image
 ```
 
 ## Requirements
 
-You need:
-
-- Python 3.11 or newer
+- Python 3.11
 - Docker
-- a Hatchet instance or local Hatchet stack
-- Nebius credentials with access to Serverless Jobs
-- a Nebius Object Storage bucket
-- container images for Whisper, translation, and TTS pushed to a registry that
-  Nebius can pull from
+- [uv](https://github.com/astral-sh/uv) for Python environment management
+- A [Hatchet Cloud](https://cloud.onhatchet.run) account (free tier works)
+- Nebius credentials with access to Serverless Jobs and Object Storage
+- Container images pushed to a public registry (Docker Hub works)
+
+## Important: Build Containers on AMD64
+
+Nebius runs x86_64 (AMD64). If you build Docker images on Apple Silicon (M1/M2/M3),
+the containers will fail to start with an architecture mismatch error.
+
+Always build and push from a Linux AMD64 machine. A Nebius CPU VM works well:
+
+```bash
+# Create a CPU VM on Nebius
+nebius compute instance create \
+  --parent-id YOUR_PROJECT_ID \
+  --name docker-builder \
+  --preset 4vcpu-16gb \
+  --platform cpu-e2 \
+  --subnet-id YOUR_SUBNET_ID \
+  --image-family ubuntu22.04 \
+  --ssh-public-key "$(cat ~/.ssh/id_rsa.pub)"
+
+# SSH in, install Docker, build and push
+sudo apt-get install -y docker.io
+docker build -t your-user/nebius-whisper:latest containers/whisper/
+docker push your-user/nebius-whisper:latest
+```
 
 ## Configuration
-
-Copy the example environment file:
 
 ```bash
 cp .env.example .env
 ```
 
-Then fill in the required values:
+Fill in the required values:
 
 ```text
-HATCHET_CLIENT_TOKEN
-NEBIUS_IAM_TOKEN
-NEBIUS_PROJECT_ID
-NEBIUS_SUBNET_ID
-NEBIUS_BUCKET_ID
-NEBIUS_BUCKET_NAME
-AWS_ACCESS_KEY_ID
-AWS_SECRET_ACCESS_KEY
-AWS_ENDPOINT_URL
-WHISPER_IMAGE
-TRANSLATE_IMAGE
-TTS_IMAGE
+HATCHET_CLIENT_TOKEN     # From Hatchet Cloud dashboard -> Settings -> API Keys
+NEBIUS_IAM_TOKEN         # From: nebius iam get-access-token
+NEBIUS_PROJECT_ID        # From: nebius iam project list
+NEBIUS_SUBNET_ID         # From: nebius vpc subnet list
+NEBIUS_BUCKET_ID         # From: nebius storage bucket list
+NEBIUS_BUCKET_NAME       # Your bucket name
+AWS_ACCESS_KEY_ID        # Nebius storage access key
+AWS_SECRET_ACCESS_KEY    # Nebius storage secret key
+AWS_ENDPOINT_URL         # https://storage.eu-north1.nebius.cloud
+WHISPER_IMAGE            # your-dockerhub-user/nebius-whisper:latest
+TRANSLATE_IMAGE          # your-dockerhub-user/nebius-translate:latest
+TTS_IMAGE                # your-dockerhub-user/nebius-tts:latest
 ```
 
-The `.env` file is intentionally ignored by Git because it contains credentials.
+> **Note on IAM tokens**: `nebius iam get-access-token` generates a short-lived
+> session token (expires in ~1 hour). For long-running workflows, create a
+> service account and use its credentials instead.
 
-## Build the Container Images
+## Install Dependencies
 
-Build and push the workload images before starting the pipeline:
+Use `uv` instead of standard `venv` — standard venv has known issues on newer
+macOS versions:
 
 ```bash
-docker build -t your-registry/nebius-whisper:latest containers/whisper/
-docker push your-registry/nebius-whisper:latest
-
-docker build -t your-registry/nebius-translate:latest containers/translate/
-docker push your-registry/nebius-translate:latest
-
-docker build -t your-registry/nebius-tts:latest containers/tts/
-docker push your-registry/nebius-tts:latest
+brew install uv
+uv venv .venv
+source .venv/bin/activate
+uv pip install -r requirements.txt
 ```
-
-Update `WHISPER_IMAGE`, `TRANSLATE_IMAGE`, and `TTS_IMAGE` in `.env` with the
-image names you pushed.
 
 ## Run the Workflow
-
-Start Hatchet locally if you are not using a hosted Hatchet instance:
-
-```bash
-docker compose up -d
-```
-
-Install the worker dependencies:
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
 
 Upload a source video to your bucket:
 
 ```bash
-aws s3 cp my-video.mp4 s3://your-bucket/input/my-video.mp4 \
+aws s3 cp my-video.mp4 s3://your-bucket/my-video.mp4 \
   --endpoint-url https://storage.eu-north1.nebius.cloud
 ```
 
@@ -204,32 +187,62 @@ Start the worker:
 python worker.py
 ```
 
-Trigger a dubbing run:
+Trigger a single dubbing run:
 
 ```bash
-python trigger.py --video input/my-video.mp4 --lang de --run-id first-run
+python trigger.py --video my-video.mp4 --lang de --run-id first-run
 ```
 
-When the workflow completes, the final dubbed video is written back to object
-storage with a key like:
+Trigger a batch of runs staggered 20 seconds apart:
+
+```bash
+python batch_trigger.py --video my-video.mp4 --count 5 --interval 20 --lang de
+```
+
+When the workflow completes, the final dubbed video is written to object storage:
 
 ```text
 my-video_first-run_dubbed.mp4
 ```
 
-## Operational Notes
+Monitor runs in the Hatchet dashboard at https://cloud.onhatchet.run. The
+**Traces** tab shows a Gantt chart of all pipeline steps.
 
-- Keep source videos and generated artifacts in object storage, not in the Git
-  repository.
-- Use unique `run_id` values to avoid overwriting outputs from earlier runs.
-- GPU stages are configured as retryable workflow tasks because they are the
-  most likely to hit capacity or preemption issues.
-- The default model choices are intended as starting points. For production
-  dubbing, you may want stronger translation, speaker-aware TTS, alignment,
-  voice cloning, subtitle generation, and review workflows.
+## Demo: Simulating Preemption
 
-## Current Limitations
+To demonstrate GPU preemption recovery during a live demo:
 
-This is a backend reference pipeline. It does not include a web UI, human review
-step, speaker diarization, lip sync, or advanced audio mixing. Those are natural
-extensions on top of the orchestration pattern used here.
+1. Trigger a batch run
+2. Wait for a run to reach the `transcribe_whisper` step (shown as running in the dashboard)
+3. Find the Nebius compute instance running the job:
+
+```bash
+nebius compute instance list --format json
+```
+
+4. Delete it to simulate preemption:
+
+```bash
+nebius compute instance delete --id INSTANCE_ID
+```
+
+5. Watch the Hatchet dashboard: the step goes red, Hatchet retries on a new GPU,
+   the step turns green. The rest of the batch continues unaffected.
+
+## Known Limitations and Workarounds
+
+**Object storage does not support seeking**: WAV and MP4 files cannot be written
+directly to the `/data` FUSE mount because ffmpeg and scipy need to seek back to
+write headers. The workaround used here is to write to `/tmp` first, then copy
+the completed file to `/data`.
+
+**Translation quality**: MADLAD-400 3B sometimes hallucinates on short texts or
+unusual input. For production use, replace it with a stronger model or a
+translation API.
+
+**No time alignment**: The dubbed audio is synthesized from the full translated
+text as a single pass. It will not match the timing of the original speech. 
+For production dubbing, forced alignment (e.g. WhisperX) is needed.
+
+**This is a reference pipeline**: No web UI, speaker diarization, lip sync, or
+audio mixing. These are natural extensions on top of the orchestration pattern.
