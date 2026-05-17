@@ -64,21 +64,6 @@ retries automatically on a new GPU.
 
 ## Architecture
 
-```text
-Hatchet Cloud (orchestration + dashboard)
-        |
-        v
-Your machine (Hatchet worker, orchestrates only)
-        |
-        v
-Nebius Object Storage (data bus — video, audio, transcript, output)
-        |
-        +-- ffmpeg CPU job        (extract audio)
-        +-- Whisper GPU job       (transcribe, preemptible L40S)
-        +-- MADLAD-400 CPU job    (translate)
-        +-- Coqui TTS GPU job     (synthesize, preemptible L40S)
-        +-- ffmpeg CPU job        (remux video)
-```
 
 ```mermaid
 flowchart TB
