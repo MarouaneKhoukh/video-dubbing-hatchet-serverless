@@ -235,26 +235,6 @@ my-video_first-run_dubbed.mp4
 Monitor runs in the Hatchet dashboard at https://cloud.onhatchet.run. The
 **Traces** tab shows a Gantt chart of all pipeline steps.
 
-## Demo: Simulating Preemption
-
-To demonstrate GPU preemption recovery during a live demo:
-
-1. Trigger a batch run
-2. Wait for a run to reach the `transcribe_whisper` step (shown as running in the dashboard)
-3. Find the Nebius compute instance running the job:
-
-```bash
-nebius compute instance list --format json
-```
-
-4. Delete it to simulate preemption:
-
-```bash
-nebius compute instance delete --id INSTANCE_ID
-```
-
-5. Watch the Hatchet dashboard: the step goes red, Hatchet retries on a new GPU,
-   the step turns green. The rest of the batch continues unaffected.
 
 ## Known Limitations and Workarounds
 
@@ -268,8 +248,32 @@ unusual input. For production use, replace it with a stronger model or a
 translation API.
 
 **No time alignment**: The dubbed audio is synthesized from the full translated
-text as a single pass. It will not match the timing of the original speech. 
+text as a single pass. It will not match the timing of the original speech.
 For production dubbing, forced alignment (e.g. WhisperX) is needed.
+
+**Output quality**: The pipeline uses lightweight open-source models chosen for
+simplicity and cost, not production quality. MADLAD-400 can produce poor
+translations on short or unusual input, and Coqui TTS produces robotic-sounding
+speech with no timing alignment to the original. This is intentional — the point
+of this repo is to demonstrate the orchestration pattern and fault-tolerance on
+preemptible GPUs, not to produce broadcast-quality dubbing.
+
+For better results, swap in stronger models at each step:
+
+- **Translation**: Replace MADLAD-400 with a larger LLM via the
+  [Nebius Token Factory API](https://tokenfactory.nebius.com) (OpenAI-compatible)
+  — Qwen3, DeepSeek V3, or Llama 3.3 70B all produce significantly better
+  translations and run on Nebius infrastructure. Alternatively use DeepL or the
+  OpenAI API.
+- **TTS**: Replace Coqui with [ElevenLabs](https://elevenlabs.io) for voice
+  cloning and natural-sounding speech, or
+  [Kokoro](https://github.com/hexgrad/kokoro) as a high-quality open-source
+  alternative.
+- **Alignment**: Add [WhisperX](https://github.com/m-bain/whisperX) between
+  transcription and TTS to force-align the dubbed audio to the original speech
+  timing.
+
+The architecture stays the same — each step is just a swappable Docker container.
 
 **This is a reference pipeline**: No web UI, speaker diarization, lip sync, or
 audio mixing. These are natural extensions on top of the orchestration pattern.
