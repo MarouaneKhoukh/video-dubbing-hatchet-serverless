@@ -11,17 +11,17 @@ transient failures, and write the final dubbed video back to storage.
 
 ## What This Repo Does
 
-The pipeline starts with a video file stored in Nebius Object Storage. A Hatchet
-workflow then coordinates a sequence of jobs:
+The pipeline starts with one or many videos in Nebius Object Storage. One Hatchet
+workflow run processes the whole batch:
 
 ```text
-input video in object storage
-  -> extract audio with ffmpeg          (Nebius CPU job)
-  -> transcribe speech with Whisper     (Nebius GPU job, preemptible)
-  -> translate transcript with MADLAD-400 (Nebius CPU job)
-  -> synthesize dubbed speech with Coqui TTS (Nebius GPU job, preemptible)
-  -> merge video with dubbed audio      (Nebius CPU job)
-  -> output dubbed video in object storage
+video_keys[] in object storage
+  -> extract           (CPU ffmpeg, batched — many files per job)
+  -> transcribe        (GPU preemptible, batched manifest — ASR + alignment)
+  -> translate         (CPU NLLB-200, batched manifest)
+  -> synthesize TTS    (GPU preemptible Kokoro, batched manifest)
+  -> remux             (CPU ffmpeg, batched — many files per job)
+  -> dubbed MP4s in object storage
 ```
 
 Your local machine only runs the Hatchet worker. It never touches the video
@@ -53,8 +53,9 @@ capacity running all the time is wasteful.
 
 Nebius Serverless Jobs let the pipeline run each stage on the right infrastructure:
 
-- CPU jobs for ffmpeg and translation
-- GPU jobs on preemptible L40S for Whisper and TTS
+- CPU jobs for ffmpeg extract/remux and NLLB-200 translation
+- GPU jobs on preemptible L40S for transcribe and Kokoro TTS
+- batched manifests so one job cold-start amortises over many files
 - mounted object storage so every container sees the same `/data` workspace
 - isolated, reproducible execution through Docker images
 
@@ -64,46 +65,45 @@ retries automatically on a new GPU.
 
 ## Architecture
 
-
 ```mermaid
 flowchart TB
     subgraph local["🖥️ Your Machine (orchestrates only)"]
-        worker["Hatchet Worker\nworker.py"]
-        trigger["trigger.py /\nbatch_trigger.py"]
+        trigger["python -m hatchet.trigger run\nfile or prefix"]
+        worker["python -m hatchet.worker"]
     end
 
     subgraph hatchet["☁️ Hatchet Cloud"]
+        wf["video-dubbing-batch-pipeline\n5 tasks · concurrency by batch_id"]
         dashboard["Dashboard\nRetries · Traces · Logs"]
     end
 
     subgraph storage["🗄️ Nebius Object Storage"]
-        bucket["workshop bucket\nvideo · audio · transcript · output"]
+        bucket["/data bucket\nvideos · wav · txt · json · mp4"]
     end
 
     subgraph nebius["⚡ Nebius Serverless Jobs"]
-        ffmpeg1["ffmpeg\nCPU job\nextract audio"]
-        whisper["faster-whisper\nGPU · L40S preemptible\ntranscribe"]
-        translate["MADLAD-400\nCPU job\ntranslate"]
-        tts["Coqui TTS\nGPU · L40S preemptible\nsynthesize"]
-        ffmpeg2["ffmpeg\nCPU job\nremux video"]
+        extract["extract\nCPU · ffmpeg\nlarge batch"]
+        transcribe["transcribe\nGPU · L40S preemptible\nmanifest batch"]
+        translate["translate\nCPU · NLLB-200\nmanifest batch"]
+        tts["tts\nGPU · L40S preemptible\nKokoro manifest batch"]
+        remux["remux\nCPU · ffmpeg\nlarge batch"]
     end
 
-    trigger -->|"trigger run"| worker
-    worker <-->|"orchestrates"| dashboard
-    worker -->|"creates jobs"| nebius
+    trigger -->|"run_no_wait(video_keys)"| wf
+    worker <-->|orchestrates| dashboard
+    worker --> wf
+    wf --> extract --> transcribe --> translate --> tts --> remux
     storage <-->|"/data mount"| nebius
-    
-    ffmpeg1 --> whisper --> translate --> tts --> ffmpeg2
 
     style local fill:#f0eeff,stroke:#7F77DD,color:#3C3489
     style hatchet fill:#eef9f5,stroke:#1D9E75,color:#0F6E56
     style storage fill:#eef9f5,stroke:#1D9E75,color:#0F6E56
     style nebius fill:#fff4ee,stroke:#D85A30,color:#993C1D
-    style ffmpeg1 fill:#faeeda,stroke:#BA7517,color:#633806
-    style whisper fill:#faece7,stroke:#D85A30,color:#993C1D
+    style extract fill:#faeeda,stroke:#BA7517,color:#633806
+    style transcribe fill:#faece7,stroke:#D85A30,color:#993C1D
     style translate fill:#faeeda,stroke:#BA7517,color:#633806
     style tts fill:#faece7,stroke:#D85A30,color:#993C1D
-    style ffmpeg2 fill:#faeeda,stroke:#BA7517,color:#633806
+    style remux fill:#faeeda,stroke:#BA7517,color:#633806
 ```
 
 
@@ -114,7 +114,7 @@ flowchart TB
 |-- worker.py                    # Starts the Hatchet worker
 |-- trigger.py                   # Triggers a single dubbing run
 |-- batch_trigger.py             # Triggers multiple runs staggered over time
-|-- requirements.txt             # Python dependencies for the worker
+|-- pyproject.toml               # Python dependencies (core + optional [download])
 |-- .env.example                 # Environment variable template
 |-- pipeline/
 |   |-- workflow.py              # Hatchet workflow and task definitions
@@ -132,7 +132,7 @@ flowchart TB
 - Python 3.11
 - Docker
 - [uv](https://github.com/astral-sh/uv) for Python environment management
-- A [Hatchet Cloud](https://cloud.onhatchet.run) account (free tier works)
+- A [Hatchet Cloud](https://cloud.hatchet.run) account (free tier works)
 - Nebius credentials with access to Serverless Jobs and Object Storage
 - Container images pushed to a public registry (Docker Hub works)
 
@@ -196,7 +196,7 @@ macOS versions:
 brew install uv
 uv venv .venv
 source .venv/bin/activate
-uv pip install -r requirements.txt
+uv pip install -e .
 ```
 
 ## Run the Workflow
@@ -232,7 +232,7 @@ When the workflow completes, the final dubbed video is written to object storage
 my-video_first-run_dubbed.mp4
 ```
 
-Monitor runs in the Hatchet dashboard at https://cloud.onhatchet.run. The
+Monitor runs in the Hatchet dashboard at https://cloud.hatchet.run. The
 **Traces** tab shows a Gantt chart of all pipeline steps.
 
 ## Screenshots
