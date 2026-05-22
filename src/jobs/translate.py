@@ -2,16 +2,11 @@
 """
 NLLB-200 translation job.
 
-Invocation modes:
-
-  Single-file (legacy):
-      python3 /translate.py <input_txt> <target_lang> <output_txt> [model_name]
-
-  Run manifest batch:
-      python3 /translate.py /data/runs/<run_id>/manifests/translate.json [chunk_idx]
+Invocation:
+    python -m jobs.translate /data/runs/<run_id>/manifests/translate.json
 """
 
-import sys
+import time
 from pathlib import Path
 
 import torch
@@ -26,15 +21,17 @@ from pipeline.metadata import (
     config_str,
     ensure_torch_device,
     load_manifest,
-    parse_manifest_argv,
+    make_timing,
+    manifest_path_from_argv,
     parse_task_runtime,
-    resolve_chunk,
+    record_task_result,
+    resolve_manifest_stems,
 )
+from pipeline.paths import build_run_items_from_stems
+from pipeline.storage import data_root
+from pipeline.utils import utc_now
 
 model_cache.configure()
-DEFAULTS = model_cache.default_model_spec()
-
-DATA = Path("/data")
 
 _NLLB_LANG: dict[str, str] = {
     "de": "deu_Latn", "fr": "fra_Latn", "es": "spa_Latn",
@@ -73,10 +70,11 @@ def _translate_one(
     output_path: Path,
     *,
     force: bool = False,
-) -> None:
+) -> bool:
+    """Returns True if processed, False if skipped."""
     if not force and output_path.exists():
         print(f"SKIP (already done): {input_path.name}", flush=True)
-        return
+        return False
     print(f"FILE: {input_path.name} -> {output_path.name}", flush=True)
     text = input_path.read_text(encoding="utf-8")
     chunks = _split_text(text)
@@ -95,6 +93,7 @@ def _translate_one(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(" ".join(translated).strip(), encoding="utf-8")
+    return True
 
 
 def _load_model(
@@ -129,62 +128,60 @@ def _load_model(
     return tokenizer, model, forced_bos_token_id
 
 
-def _run_manifest(manifest_path: Path, chunk_idx: int) -> None:
-    manifest = load_manifest(manifest_path)
-    runtime = parse_task_runtime(manifest, "translate")
-    cfg = runtime["config"]
-    target_lang = runtime["target_lang"]
-    model_name = config_str(cfg, "model")
-    device = ensure_torch_device(config_str(cfg, "device"))
-    force = runtime["force"]
-    files = resolve_chunk(manifest, chunk_idx)
+def run_task(config: dict) -> dict:
+    """Process all files described by the manifest dict. Writes report; returns payload."""
+    started_at = utc_now()
+    t0 = time.perf_counter()
+    try:
+        model_cache.configure()
+        runtime = parse_task_runtime(config, "translate")
+        cfg = runtime["config"]
+        run_id = runtime["run_id"]
+        target_lang = runtime["target_lang"]
+        model_name = config_str(cfg, "model")
+        device = ensure_torch_device(config_str(cfg, "device"))
+        force = runtime["force"]
 
-    print(
-        f"MANIFEST: {manifest_path.name} chunk={chunk_idx} | {len(files)} files | "
-        f"model={model_name} device={device} force={force}",
-        flush=True,
-    )
-    tokenizer, model, forced = _load_model(model_name, target_lang, device)
+        stems = resolve_manifest_stems(config)
+        items = build_run_items_from_stems(stems, run_id)
 
-    for idx, item in enumerate(files, 1):
-        print(f"\n[{idx}/{len(files)}]", flush=True)
-        _translate_one(
-            tokenizer, model, forced,
-            DATA / item["transcript_key"],
-            DATA / item["translated_key"],
-            force=force,
+        print(
+            f"TASK: translate run_id={run_id} | {len(items)} files | "
+            f"model={model_name} device={device} target={target_lang} force={force}",
+            flush=True,
         )
+        tokenizer, model, forced = _load_model(model_name, target_lang, device)
 
-    print(f"\nChunk complete: {len(files)} files processed", flush=True)
+        data = data_root()
+        processed = 0
+        for idx, item in enumerate(items, 1):
+            print(f"\n[{idx}/{len(items)}]", flush=True)
+            if _translate_one(
+                tokenizer, model, forced,
+                data / item["transcript_key"],
+                data / item["translated_key"],
+                force=force,
+            ):
+                processed += 1
 
-
-def _run_single(
-    input_path: Path,
-    target_lang: str,
-    output_path: Path,
-    model_name: str,
-    *,
-    device: str = "cpu",
-) -> None:
-    tokenizer, model, forced = _load_model(model_name, target_lang, device)
-    _translate_one(tokenizer, model, forced, input_path, output_path)
+        skipped = len(items) - processed
+        print(f"\nTask complete: {processed} processed, {skipped} skipped", flush=True)
+        result = {
+            "translated_keys": [i["translated_key"] for i in items],
+            "timing": make_timing(
+                "translate", total=len(items), processed=processed, skipped=skipped, t0=t0
+            ),
+        }
+        record_task_result(config, result, started_at=started_at)
+        return result
+    except Exception as exc:
+        record_task_result(config, {}, started_at=started_at, failed=True, error=str(exc))
+        raise
 
 
 def main() -> None:
-    if len(sys.argv) < 2:
-        raise SystemExit(
-            "usage: translate.py <input_txt> <target_lang> <output_txt> [model]  OR  "
-            "translate.py <task_manifest.json> [chunk_idx]"
-        )
-    arg1 = Path(sys.argv[1])
-    if arg1.suffix == ".json":
-        manifest_path, chunk_idx = parse_manifest_argv()
-        _run_manifest(manifest_path, chunk_idx)
-        return
-    target_lang = sys.argv[2]
-    output_path = Path(sys.argv[3])
-    model_name = sys.argv[4] if len(sys.argv) > 4 else DEFAULTS.translate_model
-    _run_single(arg1, target_lang, output_path, model_name)
+    config = load_manifest(manifest_path_from_argv())
+    run_task(config)
 
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from hatchet.console import get_console
-from pipeline.config import get_settings
+from pipeline.config import get_config
 from pipeline.paths import resolve_video_keys
 
 if TYPE_CHECKING:
@@ -97,7 +97,7 @@ def cmd_run(
         ...,
         help="Video file or folder prefix under the bucket mount (e.g. sample.mp4 or sample_batch/)",
     ),
-    lang: str = typer.Option(get_settings().target_lang, "--lang", help="Target language code"),
+    lang: str = typer.Option(get_config().pipeline.target_lang, "--lang", help="Target language code"),
     run_id: str = typer.Option("demo", "--run-id", help="Run label (output namespace)"),
     batch_id: str = typer.Option(
         "default", "--batch-id", help="Hatchet concurrency key for parallel batch runs"

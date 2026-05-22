@@ -19,12 +19,10 @@ RUN chmod +x /usr/local/bin/uv-sync-task
 RUN --mount=type=cache,target=/root/.cache/uv \
     USE_CUDA_SOURCES=${USE_CUDA_SOURCES} uv-sync-task tts
 
-# Layer 6 — job script
+# Layer 6 — source packages
 COPY src/pipeline /pipeline
-COPY src/models/whisper.py /whisper.py
-COPY src/models/model_cache.py /model_cache.py
-COPY src/jobs/tts.py /tts.py
-COPY src/models/download_models.py /download_models.py
+COPY src/jobs     /jobs
+COPY src/models   /models
 
 ENV PYTHONPATH=/ \
     MODEL_CACHE_DIR=/data/models \
@@ -32,4 +30,4 @@ ENV PYTHONPATH=/ \
     HUGGINGFACE_HUB_CACHE=/data/models/huggingface/hub \
     TORCH_HOME=/data/models/torch
 
-ENTRYPOINT ["python3", "/tts.py"]
+ENTRYPOINT ["python3", "-m", "jobs.tts"]

@@ -1,21 +1,31 @@
 """
-Nested per-task pydantic settings.
+Two-tier configuration:
 
-Task defaults live in the config classes below. ``Settings.__init__`` loads
-``.env`` when instantiated (lazy via ``get_settings()`` — not at import time).
-Cloud credentials are optional until Nebius/S3/Hatchet code paths run.
+- ``config`` (``HatchetConfig``) — top-level user-facing config. The orchestrator
+  (Hatchet) sits at the root and contains the pipeline it runs:
 
-Override task fields via nested env vars, e.g.:
+      HatchetConfig                          ← top-level, BaseSettings (env-aware)
+      ├── workflow_name, timeout_buffer_s
+      ├── stages: HatchetStages              ← per-stage orchestration (max_concurrent, retries)
+      └── pipeline: PipelineConfig           ← what gets orchestrated
+          ├── target_lang, image_tag
+          └── extract, transcribe, …         ← per-stage algorithm + compute (StageConfig)
 
-    TRANSCRIBE__COMPUTE__PLATFORM=gpu-h200-sxm
-    TRANSCRIBE__MODEL=large-v3
-    TTS__LANG=e
-    TARGET_LANG=es
+- ``secrets`` (``Secrets``) — cloud credentials and bindings. Loaded from ``.env``
+  (gitignored) by convention.
+
+Override nested fields via double-underscore env vars, e.g.:
+
+    PIPELINE__IMAGE_TAG=v0.2.0
+    PIPELINE__TARGET_LANG=de
+    PIPELINE__TRANSCRIBE__COMPUTE__PLATFORM=gpu-h200-sxm
+    PIPELINE__TRANSCRIBE__MODEL=large-v3
+    STAGES__TRANSCRIBE__MAX_CONCURRENT=8
+    STAGES__TRANSCRIBE__RETRIES=5
 """
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -28,53 +38,54 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # | CPU       | cpu-e2       | 4vcpu-16gb …       |
 
 
-class ComputeConfig(BaseModel):
-    """Nebius Serverless Job platform + preset for one pipeline task."""
+class Compute(BaseModel):
+    """Cloud machine spec for one pipeline stage — feeds directly into Nebius ``JobSpec``.
 
-    gpu: bool = False
+    ``job_timeout_min`` is the single source of truth for "how long this stage may
+    run". The Hatchet ``execution_timeout`` is derived from it plus
+    ``HatchetConfig.timeout_buffer_s``.
+    """
+
     platform: str = "cpu-e2"
     preset: str = "4vcpu-16gb"
     preemptible: bool = False
-
-
-class TaskConfig(BaseModel):
-    """Shared per-task knobs. Subclasses set compute defaults and model fields."""
-
-    image: str
-    batch_size: int = 10
-    max_concurrent: int = 10
+    job_disk_gb: int = 450
     job_timeout_min: int = 60
-    hatchet_timeout_s: int = 3600
-    retries: int = 0
-    compute: ComputeConfig = Field(default_factory=ComputeConfig)
 
 
-class ExtractConfig(TaskConfig):
-    image: str = "lscr.io/linuxserver/ffmpeg:latest"
+class StageConfig(BaseModel):
+    image_name: str  # registry/repo without tag; tag from PipelineConfig.image_tag
+    batch_size: int = 10  # files per Nebius job (chunk size)
+    compute: Compute = Field(default_factory=Compute)
+
+
+class ExtractConfig(StageConfig):
+    image_name: str = "mnrozhkov/video-dubbing-extract"
     batch_size: int = 50
-    max_concurrent: int = 2
-    job_timeout_min: int = 20
-    hatchet_timeout_s: int = 900
-    compute: ComputeConfig = Field(
-        default_factory=lambda: ComputeConfig(
-            gpu=False, platform="cpu-e2", preset="4vcpu-16gb", preemptible=False
+    compute: Compute = Field(default_factory=lambda: Compute(job_timeout_min=20))
+
+
+class TranscribeConfig(StageConfig):
+    image_name: str = "mnrozhkov/video-dubbing-transcribe"
+    model: str = "distil-large-v3"
+    device: str = "cuda"
+    align_lang: str = "en"  # WhisperX align weights for English source audio
+    compute: Compute = Field(
+        default_factory=lambda: Compute(
+            platform="gpu-l40s-d",
+            preset="1gpu-16vcpu-96gb",
+            preemptible=True,
+            job_timeout_min=90,
         )
     )
 
 
-class TranscribeConfig(TaskConfig):
-    image: str = "mnrozhkov/nebius-transcribe:v0.1.0"
-    model: str = "distil-large-v3"
+class TranslateConfig(StageConfig):
+    image_name: str = "mnrozhkov/video-dubbing-translate"
+    model: str = "facebook/nllb-200-distilled-1.3B"
     device: str = "cuda"
-    align_lang: str = "en"  # WhisperX align weights for English source audio
-    batch_size: int = 10
-    max_concurrent: int = 10
-    job_timeout_min: int = 90
-    hatchet_timeout_s: int = 4500
-    retries: int = 3
-    compute: ComputeConfig = Field(
-        default_factory=lambda: ComputeConfig(
-            gpu=True,
+    compute: Compute = Field(
+        default_factory=lambda: Compute(
             platform="gpu-l40s-d",
             preset="1gpu-16vcpu-96gb",
             preemptible=True,
@@ -82,38 +93,14 @@ class TranscribeConfig(TaskConfig):
     )
 
 
-class TranslateConfig(TaskConfig):
-    image: str = "mnrozhkov/nebius-translate:v0.1.0"
-    model: str = "facebook/nllb-200-distilled-1.3B"
-    device: str = "cuda"
-    batch_size: int = 10
-    max_concurrent: int = 10
-    job_timeout_min: int = 40
-    hatchet_timeout_s: int = 1800
-    compute: ComputeConfig = Field(
-        default_factory=lambda: ComputeConfig(
-            gpu=False,
-            platform="cpu-e2",
-            preset="8vcpu-32gb",
-            preemptible=False,
-        )
-    )
-
-
-class TtsConfig(TaskConfig):
-    image: str = "mnrozhkov/nebius-tts:v0.1.0"
+class TtsConfig(StageConfig):
+    image_name: str = "mnrozhkov/video-dubbing-tts"
     voice: str = "af_bella"
     lang: str = "e"  # Kokoro Spanish pipeline (EN source → ES dub)
     repo: str = "hexgrad/Kokoro-82M"
     device: str = "cuda"
-    batch_size: int = 10
-    max_concurrent: int = 10
-    job_timeout_min: int = 60
-    hatchet_timeout_s: int = 2700
-    retries: int = 3
-    compute: ComputeConfig = Field(
-        default_factory=lambda: ComputeConfig(
-            gpu=True,
+    compute: Compute = Field(
+        default_factory=lambda: Compute(
             platform="gpu-l40s-d",
             preset="1gpu-16vcpu-96gb",
             preemptible=True,
@@ -121,31 +108,79 @@ class TtsConfig(TaskConfig):
     )
 
 
-class RemuxConfig(TaskConfig):
-    image: str = "lscr.io/linuxserver/ffmpeg:latest"
+class RemuxConfig(StageConfig):
+    image_name: str = "mnrozhkov/video-dubbing-remux"
     batch_size: int = 50
-    max_concurrent: int = 2
-    job_timeout_min: int = 20
-    hatchet_timeout_s: int = 900
-    compute: ComputeConfig = Field(
-        default_factory=lambda: ComputeConfig(
-            gpu=False, platform="cpu-e2", preset="4vcpu-16gb", preemptible=False
-        )
-    )
+    compute: Compute = Field(default_factory=lambda: Compute(job_timeout_min=20))
 
 
-class HardwareConfig(BaseModel):
-    """Shared Nebius job resources not tied to a single task."""
+class PipelineConfig(BaseModel):
+    """What gets orchestrated — pure pipeline definition. No env loading here;
+    that happens at ``HatchetConfig`` (the top-level ``BaseSettings``)."""
 
-    job_disk_gb: int = 250
-    models_bucket_prefix: str = "models"
-    models_container_path: str = "/data/models"
+    target_lang: str = "es"  # NLLB translate target (EN → ES); override via PIPELINE__TARGET_LANG
+    image_tag: str = "v0.1.0"  # applied to every stage's image; override via PIPELINE__IMAGE_TAG
+
+    extract:    ExtractConfig    = Field(default_factory=ExtractConfig)
+    transcribe: TranscribeConfig = Field(default_factory=TranscribeConfig)
+    translate:  TranslateConfig  = Field(default_factory=TranslateConfig)
+    tts:        TtsConfig        = Field(default_factory=TtsConfig)
+    remux:      RemuxConfig      = Field(default_factory=RemuxConfig)
 
 
-class _EnvConfig(BaseSettings):
-    """Internal loader — merges .env, process env, and code defaults."""
+class StageOrchestration(BaseModel):
+    """Hatchet orchestration knobs for one stage.
+
+    ``max_concurrent`` is the cap on parallel Nebius jobs for this stage when
+    fan-out lands (Phase 4 / .dev/spec.md). Today it's declared but unwired.
+    ``retries`` IS wired and feeds ``@workflow.task(retries=…)`` — primary use is
+    preemption recovery (Nebius ERROR → RuntimeError → Hatchet retries).
+    """
+
+    max_concurrent: int = 1
+    retries: int = 3
+
+
+class HatchetStages(BaseModel):
+    """Per-stage Hatchet orchestration — mirrors PipelineConfig stage names."""
+
+    extract:    StageOrchestration = Field(default_factory=lambda: StageOrchestration(max_concurrent=1))
+    transcribe: StageOrchestration = Field(default_factory=lambda: StageOrchestration(max_concurrent=4))
+    translate:  StageOrchestration = Field(default_factory=lambda: StageOrchestration(max_concurrent=8))
+    tts:        StageOrchestration = Field(default_factory=lambda: StageOrchestration(max_concurrent=4))
+    remux:      StageOrchestration = Field(default_factory=lambda: StageOrchestration(max_concurrent=1))
+
+
+class HatchetConfig(BaseSettings):
+    """Top-level config: Hatchet orchestrator + the pipeline it runs.
+
+    Loaded lazily from process env + ``.env`` via ``get_config()``. Cloud
+    credentials default to empty strings so local-only runs work without
+    Hatchet/Nebius configuration.
+    """
 
     model_config = SettingsConfigDict(
+        env_file=".env",
+        env_nested_delimiter="__",
+        extra="ignore",
+    )
+
+    # ── Workflow-level ─────────────────────────────────────────────────
+    workflow_name: str = "video-dubbing-batch-pipeline"
+    timeout_buffer_s: int = 600  # cold start + SDK overhead; added to job_timeout_min
+
+    # ── Per-stage orchestration ────────────────────────────────────────
+    stages: HatchetStages = Field(default_factory=HatchetStages)
+
+    # ── What's being orchestrated ──────────────────────────────────────
+    pipeline: PipelineConfig = Field(default_factory=PipelineConfig)
+
+
+class Secrets(BaseSettings):
+    """Cloud credentials and bindings — loaded from ``.env`` (never committed)."""
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
         env_nested_delimiter="__",
         extra="ignore",
     )
@@ -160,78 +195,25 @@ class _EnvConfig(BaseSettings):
     aws_secret_access_key: str = ""
     aws_endpoint_url: str = "https://storage.eu-north1.nebius.cloud"
 
-    target_lang: str = "es"  # NLLB translate target (EN → ES); override via TARGET_LANG
-    max_concurrent_batches: int = 5
 
-    hardware: HardwareConfig = Field(default_factory=HardwareConfig)
-    extract: ExtractConfig = Field(default_factory=ExtractConfig)
-    transcribe: TranscribeConfig = Field(default_factory=TranscribeConfig)
-    translate: TranslateConfig = Field(default_factory=TranslateConfig)
-    tts: TtsConfig = Field(default_factory=TtsConfig)
-    remux: RemuxConfig = Field(default_factory=RemuxConfig)
+_config: HatchetConfig | None = None
+_secrets: Secrets | None = None
 
 
-class Settings:
-    """
-    Pipeline settings loaded from ``.env`` on construction.
-
-    Cloud credential fields default to empty strings so local-only runs work
-    without Nebius/Hatchet configuration. Call sites that need cloud access
-    should use ``require_cloud_setting()`` before using those values.
-    """
-
-    hatchet_client_token: str
-    nebius_iam_token: str
-    nebius_project_id: str
-    nebius_subnet_id: str
-    nebius_bucket_id: str
-    nebius_bucket_name: str
-    aws_access_key_id: str
-    aws_secret_access_key: str
-    aws_endpoint_url: str
-    target_lang: str
-    max_concurrent_batches: int
-    hardware: HardwareConfig
-    extract: ExtractConfig
-    transcribe: TranscribeConfig
-    translate: TranslateConfig
-    tts: TtsConfig
-    remux: RemuxConfig
-
-    def __init__(self, env_file: str | Path = ".env") -> None:
-        path = Path(env_file)
-        kwargs: dict[str, Any] = {}
-        if path.is_file():
-            kwargs["_env_file"] = path
-        loaded = _EnvConfig(**kwargs)
-        self.hatchet_client_token = loaded.hatchet_client_token
-        self.nebius_iam_token = loaded.nebius_iam_token
-        self.nebius_project_id = loaded.nebius_project_id
-        self.nebius_subnet_id = loaded.nebius_subnet_id
-        self.nebius_bucket_id = loaded.nebius_bucket_id
-        self.nebius_bucket_name = loaded.nebius_bucket_name
-        self.aws_access_key_id = loaded.aws_access_key_id
-        self.aws_secret_access_key = loaded.aws_secret_access_key
-        self.aws_endpoint_url = loaded.aws_endpoint_url
-        self.target_lang = loaded.target_lang
-        self.max_concurrent_batches = loaded.max_concurrent_batches
-        self.hardware = loaded.hardware
-        self.extract = loaded.extract
-        self.transcribe = loaded.transcribe
-        self.translate = loaded.translate
-        self.tts = loaded.tts
-        self.remux = loaded.remux
+def get_config() -> HatchetConfig:
+    """Return cached config, loading ``.env`` on first call."""
+    global _config
+    if _config is None:
+        _config = HatchetConfig()
+    return _config
 
 
-_settings: Settings | None = None
-
-
-def get_settings() -> Settings:
-    """Return cached settings, loading ``.env`` on first call."""
-    global _settings
-    if _settings is None:
-        _settings = Settings()
-    return _settings
+def get_secrets() -> Secrets:
+    """Return cached secrets, loading ``.env`` on first call."""
+    global _secrets
+    if _secrets is None:
+        _secrets = Secrets()
+    return _secrets
 
 
 def require_cloud_setting(name: str, value: str) -> str:
@@ -243,9 +225,15 @@ def require_cloud_setting(name: str, value: str) -> str:
     return value
 
 
-class _SettingsProxy:
+class _ConfigProxy:
     def __getattr__(self, name: str) -> Any:
-        return getattr(get_settings(), name)
+        return getattr(get_config(), name)
 
 
-settings = _SettingsProxy()
+class _SecretsProxy:
+    def __getattr__(self, name: str) -> Any:
+        return getattr(get_secrets(), name)
+
+
+config = _ConfigProxy()
+secrets = _SecretsProxy()

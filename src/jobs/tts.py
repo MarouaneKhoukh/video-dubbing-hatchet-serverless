@@ -2,16 +2,11 @@
 """
 Kokoro TTS job.
 
-Invocation modes:
-
-  Single-file (legacy):
-      python3 /tts.py <input_txt> <output_wav> [voice] [lang_code]
-
-  Run manifest batch:
-      python3 /tts.py /data/runs/<run_id>/manifests/tts.json [chunk_idx]
+Invocation:
+    python -m jobs.tts /data/runs/<run_id>/manifests/tts.json
 """
 
-import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -27,15 +22,17 @@ from pipeline.metadata import (
     config_str,
     ensure_torch_device,
     load_manifest,
-    parse_manifest_argv,
+    make_timing,
+    manifest_path_from_argv,
     parse_task_runtime,
-    resolve_chunk,
+    record_task_result,
+    resolve_manifest_stems,
 )
+from pipeline.paths import build_run_items_from_stems
+from pipeline.storage import data_root
+from pipeline.utils import utc_now
 
 model_cache.configure()
-DEFAULTS = model_cache.default_model_spec()
-
-DATA = Path("/data")
 
 
 def _split_text(text: str, max_chars: int = 500) -> list[str]:
@@ -65,10 +62,11 @@ def _synthesize_one(
     output_path: Path,
     *,
     force: bool = False,
-) -> None:
+) -> bool:
+    """Returns True if processed, False if skipped."""
     if not force and output_path.exists():
         print(f"SKIP (already done): {input_path.name}", flush=True)
-        return
+        return False
     print(f"FILE: {input_path.name} -> {output_path.name}", flush=True)
     text = input_path.read_text(encoding="utf-8").strip()
     chunks = _split_text(text)
@@ -86,6 +84,7 @@ def _synthesize_one(
     combined = np.concatenate(audio_chunks)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     sf.write(str(output_path), combined, 24000)
+    return True
 
 
 def _load_pipeline(lang: str, repo: str, device: str) -> KPipeline:
@@ -98,65 +97,61 @@ def _load_pipeline(lang: str, repo: str, device: str) -> KPipeline:
     return KPipeline(lang_code=lang, repo_id=repo, device=device)
 
 
-def _run_manifest(manifest_path: Path, chunk_idx: int) -> None:
-    manifest = load_manifest(manifest_path)
-    runtime = parse_task_runtime(manifest, "tts")
-    cfg = runtime["config"]
-    voice = config_str(cfg, "voice")
-    lang = config_str(cfg, "lang")
-    repo = config_str(cfg, "repo")
-    device = ensure_torch_device(config_str(cfg, "device"))
-    force = runtime["force"]
-    files = resolve_chunk(manifest, chunk_idx)
+def run_task(config: dict) -> dict:
+    """Process all files described by the manifest dict. Writes report; returns payload."""
+    started_at = utc_now()
+    t0 = time.perf_counter()
+    try:
+        model_cache.configure()
+        runtime = parse_task_runtime(config, "tts")
+        cfg = runtime["config"]
+        run_id = runtime["run_id"]
+        voice = config_str(cfg, "voice")
+        lang = config_str(cfg, "lang")
+        repo = config_str(cfg, "repo")
+        device = ensure_torch_device(config_str(cfg, "device"))
+        force = runtime["force"]
 
-    print(
-        f"MANIFEST: {manifest_path.name} chunk={chunk_idx} | {len(files)} files | "
-        f"voice={voice} lang={lang} device={device} force={force}",
-        flush=True,
-    )
-    pipeline = _load_pipeline(lang, repo, device)
+        stems = resolve_manifest_stems(config)
+        items = build_run_items_from_stems(stems, run_id)
 
-    for idx, item in enumerate(files, 1):
-        print(f"\n[{idx}/{len(files)}]", flush=True)
-        _synthesize_one(
-            pipeline, voice,
-            DATA / item["translated_key"],
-            DATA / item["dubbed_key"],
-            force=force,
+        print(
+            f"TASK: tts run_id={run_id} | {len(items)} files | "
+            f"voice={voice} lang={lang} device={device} force={force}",
+            flush=True,
         )
+        pipeline = _load_pipeline(lang, repo, device)
 
-    print(f"\nChunk complete: {len(files)} files processed", flush=True)
+        data = data_root()
+        processed = 0
+        for idx, item in enumerate(items, 1):
+            print(f"\n[{idx}/{len(items)}]", flush=True)
+            if _synthesize_one(
+                pipeline, voice,
+                data / item["translated_key"],
+                data / item["dubbed_key"],
+                force=force,
+            ):
+                processed += 1
 
-
-def _run_single(
-    input_path: Path,
-    output_path: Path,
-    voice: str,
-    lang: str,
-    *,
-    device: str = "cpu",
-) -> None:
-    repo = DEFAULTS.tts_repo
-    print(f"Loading Kokoro pipeline (voice={voice}, lang={lang}, device={device})", flush=True)
-    pipeline = _load_pipeline(lang, repo, device)
-    _synthesize_one(pipeline, voice, input_path, output_path)
+        skipped = len(items) - processed
+        print(f"\nTask complete: {processed} processed, {skipped} skipped", flush=True)
+        result = {
+            "dubbed_keys": [i["dubbed_key"] for i in items],
+            "timing": make_timing(
+                "tts", total=len(items), processed=processed, skipped=skipped, t0=t0
+            ),
+        }
+        record_task_result(config, result, started_at=started_at)
+        return result
+    except Exception as exc:
+        record_task_result(config, {}, started_at=started_at, failed=True, error=str(exc))
+        raise
 
 
 def main() -> None:
-    if len(sys.argv) < 2:
-        raise SystemExit(
-            "usage: tts.py <input_txt> <output_wav> [voice] [lang]  OR  "
-            "tts.py <task_manifest.json> [chunk_idx]"
-        )
-    arg1 = Path(sys.argv[1])
-    if arg1.suffix == ".json":
-        manifest_path, chunk_idx = parse_manifest_argv()
-        _run_manifest(manifest_path, chunk_idx)
-        return
-    output_path = Path(sys.argv[2])
-    voice = sys.argv[3] if len(sys.argv) > 3 else DEFAULTS.tts_voice
-    lang = sys.argv[4] if len(sys.argv) > 4 else DEFAULTS.tts_lang
-    _run_single(arg1, output_path, voice, lang)
+    config = load_manifest(manifest_path_from_argv())
+    run_task(config)
 
 
 if __name__ == "__main__":

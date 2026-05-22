@@ -66,9 +66,9 @@ def default_model_spec() -> ModelSpec:
 
 
 def load_model_spec() -> ModelSpec:
-    """Load from Settings when .env credentials exist; else task class defaults."""
+    """Load from PipelineConfig when .env credentials exist; else stage class defaults."""
     try:
-        s = config_module().get_settings()
+        s = config_module().get_config().pipeline
         return ModelSpec(
             transcribe_model=s.transcribe.model,
             transcribe_device=s.transcribe.device,

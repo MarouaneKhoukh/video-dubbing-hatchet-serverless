@@ -1,16 +1,18 @@
 """
-Local pipeline CLI — run dubbing via Docker on ./data (no Hatchet/Nebius).
+Local pipeline CLI — run dubbing stages in-process Python (no Docker/Hatchet).
 
 Usage:
-    python -m pipeline run sample.mp4 --run-id demo
-    python -m pipeline run sample_batch/ --run-id batch-001
-    python -m pipeline run sample.mp4 --stage transcribe --run-id demo
-    python -m pipeline run sample.mp4 --force --device cpu
+    python -m pipeline run sample_file/sample.mp4 --run-id demo
+    python -m pipeline run sample_batch/           --run-id batch-001
+    python -m pipeline run sample_file/sample.mp4 --stage transcribe --run-id demo
+    python -m pipeline run sample_file/sample.mp4 --force --device cpu
+
+    python -m pipeline prepare-manifest extract    --run-id demo --source sample_file/sample.mp4
+    python -m pipeline prepare-manifest transcribe --run-id demo
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from pathlib import Path
 
@@ -18,16 +20,19 @@ import typer
 from rich.panel import Panel
 from rich.table import Table
 
-from pipeline.config import get_settings
-from pipeline.paths import repo_data_dir, resolve_video_keys
+from pipeline.config import get_config
+from pipeline.paths import (
+    repo_data_dir,
+    resolve_video_keys,
+    task_manifest_object_key,
+)
 from pipeline.run import STAGE_ORDER, PipelineRun, run_pipeline, run_stage
-from pipeline.runner.local import LocalExecutor
 from pipeline.storage import use_local_artifacts
 from pipeline.utils import get_console, setup_logging
 
 app = typer.Typer(
     name="pipeline",
-    help="Run the dubbing pipeline locally via Docker (./data mounted at /data).",
+    help="Run the dubbing pipeline locally in-process Python (./data as the artifact root).",
     no_args_is_help=True,
 )
 logger = logging.getLogger(__name__)
@@ -35,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 @app.callback()
 def _root() -> None:
-    """Local dubbing pipeline (Docker on ./data)."""
+    """Local dubbing pipeline (Python in-process)."""
 
 
 def _print_summary(
@@ -45,7 +50,6 @@ def _print_summary(
     data_dir: Path,
     stages: list[str],
     device: str,
-    use_gpu: bool,
 ) -> None:
     console = get_console()
     mode = "single" if len(video_keys) == 1 else f"batch ({len(video_keys)} files)"
@@ -54,14 +58,13 @@ def _print_summary(
     table.add_column(style="dim")
     table.add_column()
     table.add_row("Mode", mode)
-    table.add_row("Executor", "local-docker")
+    table.add_row("Executor", "python (in-process)")
     table.add_row("Data dir", str(data_dir))
     table.add_row("Language", run.target_lang)
     table.add_row("Run ID", run.run_id)
     table.add_row("Stages", ", ".join(stages))
     table.add_row("Force", str(run.force))
     table.add_row("Transcribe device", device)
-    table.add_row("Docker GPU", str(use_gpu))
     table.add_row("Output prefix", f"runs/{run.run_id}/")
 
     if len(video_keys) <= 10:
@@ -79,9 +82,9 @@ def _print_summary(
 def cmd_run(
     source: str = typer.Argument(
         ...,
-        help="Video file or folder under data/ (e.g. sample.mp4 or sample_batch/)",
+        help="Video file or folder under data/ (e.g. sample_file/sample.mp4 or sample_batch/)",
     ),
-    lang: str = typer.Option(get_settings().target_lang, "--lang", help="Target language code"),
+    lang: str = typer.Option(get_config().pipeline.target_lang, "--lang", help="Target language code"),
     run_id: str = typer.Option("demo", "--run-id", help="Run label (output namespace)"),
     batch_id: str = typer.Option("local", "--batch-id", help="Batch label (stored on run manifest)"),
     force: bool = typer.Option(
@@ -95,29 +98,18 @@ def cmd_run(
     data_dir: Path = typer.Option(
         None,
         "--data-dir",
-        help="Host data directory mounted at /data (default: <repo>/data)",
-    ),
-    models_dir: Path = typer.Option(
-        None,
-        "--models-dir",
-        help="Model cache directory (default: <data-dir>/models)",
+        help="Host data directory used as artifact root (default: <repo>/data)",
     ),
     device: str = typer.Option(
         "cpu",
         "--device",
-        help="Transcribe device passed to the container (cpu or cuda)",
-    ),
-    gpus: bool = typer.Option(
-        False,
-        "--gpus",
-        help="Pass --gpus all to GPU task containers (transcribe, tts)",
+        help="Device override for transcribe/translate/tts (cpu or cuda)",
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Debug logging"),
 ) -> None:
     """Run dubbing locally for one video or all videos under a prefix."""
     setup_logging(verbose=verbose)
     resolved_data = (data_dir or repo_data_dir()).resolve()
-    resolved_models = (models_dir or resolved_data / "models").resolve()
 
     try:
         with use_local_artifacts(resolved_data):
@@ -142,38 +134,36 @@ def cmd_run(
         batch_id=batch_id,
         force=force,
     )
-    executor = LocalExecutor(resolved_data, models_dir=resolved_models, use_gpu=gpus)
     _print_summary(
         run_input,
         video_keys,
         data_dir=resolved_data,
         stages=stages,
         device=device,
-        use_gpu=gpus,
     )
 
-    cli_overrides = {"transcribe": {"device": device}}
+    cli_overrides = {
+        task: {"device": device} for task in ("transcribe", "translate", "tts")
+    }
 
-    async def _run() -> dict[str, dict]:
-        with use_local_artifacts(resolved_data):
-            if len(stages) == 1:
-                result = await run_stage(
+    with use_local_artifacts(resolved_data):
+        if len(stages) == 1:
+            results = {
+                stages[0]: run_stage(
                     stages[0],
                     run_input,
-                    executor=executor,
                     cli_overrides=cli_overrides,
                     log=logger.info,
                 )
-                return {stages[0]: result}
-            return await run_pipeline(
+            }
+        else:
+            results = run_pipeline(
                 run_input,
-                executor=executor,
                 stages=stages,
                 cli_overrides=cli_overrides,
                 log=logger.info,
             )
 
-    results = asyncio.run(_run())
     get_console().print(
         Panel(
             f"[bold green]Done.[/bold green] Outputs under [bold]{resolved_data}/runs/{run_id}/[/bold]\n"
@@ -184,6 +174,77 @@ def cmd_run(
     )
     if verbose:
         get_console().print(results)
+
+
+@app.command("prepare-manifest")
+def cmd_prepare_manifest(
+    stage: str = typer.Argument(..., help=f"Stage name: one of {', '.join(STAGE_ORDER)}"),
+    run_id: str = typer.Option(..., "--run-id", help="Run label (output namespace)"),
+    source: str = typer.Option(
+        None,
+        "--source",
+        help="Video file/folder under data/ (required for extract; ignored for downstream stages)",
+    ),
+    lang: str = typer.Option(get_config().pipeline.target_lang, "--lang", help="Target language code"),
+    batch_id: str = typer.Option("local", "--batch-id", help="Batch label"),
+    force: bool = typer.Option(False, "--force", help="Set force=true in the manifest"),
+    device: str = typer.Option(
+        "cpu",
+        "--device",
+        help="Device override for transcribe/translate/tts (cpu or cuda)",
+    ),
+    data_dir: Path = typer.Option(
+        None, "--data-dir", help="Host data directory (default: <repo>/data)"
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Debug logging"),
+) -> None:
+    """Write a task manifest to runs/<id>/manifests/<stage>.json (no execution)."""
+    from pipeline.metadata import build_task_manifest
+    from pipeline.storage import upload_json
+
+    setup_logging(verbose=verbose)
+    if stage not in STAGE_ORDER:
+        raise typer.BadParameter(f"Unknown stage {stage!r}; choose from: {', '.join(STAGE_ORDER)}")
+
+    resolved_data = (data_dir or repo_data_dir()).resolve()
+
+    if stage == "extract":
+        if not source:
+            raise typer.BadParameter("--source is required for the extract stage")
+        try:
+            with use_local_artifacts(resolved_data):
+                video_keys = resolve_video_keys(source, data_root=resolved_data)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+    else:
+        video_keys = []  # downstream stages derive inputs from upstream reports
+
+    run_input = PipelineRun(
+        video_keys=video_keys,
+        target_lang=lang,
+        run_id=run_id,
+        batch_id=batch_id,
+        force=force,
+    )
+    cli_overrides = {
+        task: {"device": device} for task in ("transcribe", "translate", "tts")
+    }
+
+    with use_local_artifacts(resolved_data):
+        manifest = build_task_manifest(
+            run_input, stage, cli_overrides=cli_overrides, executor="docker"
+        )
+        key = task_manifest_object_key(run_id, stage)
+        upload_json(manifest.model_dump(), key)
+
+    get_console().print(
+        Panel(
+            f"Manifest written: [bold]{resolved_data / key}[/bold]\n"
+            f"Container path:   [bold]/data/{key}[/bold]",
+            title=f"prepare-manifest {stage}",
+            border_style="green",
+        )
+    )
 
 
 def main() -> None:

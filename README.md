@@ -263,8 +263,7 @@ translation API.
 
 **No time alignment**: The dubbed audio is synthesized from the full translated
 text as a single pass. It will not match the timing of the original speech.
-For production dubbing, forced alignment (e.g. WhisperX) is needed.
-
+For production dubbing, forced alignment (e.g. WhisperX) is needePЗ
 **Output quality**: The pipeline uses lightweight open-source models chosen for
 simplicity and cost, not production quality. MADLAD-400 can produce poor
 translations on short or unusual input, and Coqui TTS produces robotic-sounding

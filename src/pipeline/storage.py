@@ -20,7 +20,7 @@ from typing import Any, Callable, Generator, Iterable, TypeVar
 import boto3
 from botocore.exceptions import ClientError
 
-from pipeline.config import require_cloud_setting, settings
+from pipeline.config import require_cloud_setting, secrets
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +43,17 @@ def _effective_local_root() -> Path | None:
     if ctx is not None:
         return ctx
     return _default_data_root
+
+
+def data_root() -> Path:
+    """Effective filesystem root for the /data mount.
+
+    Returns the host directory when ``use_local_artifacts`` (or ``configure_data_root``)
+    is active — typically ``./data`` for in-process Python runs. Otherwise returns
+    ``/data``, which is the bucket mount path inside a container.
+    """
+    local = _effective_local_root()
+    return local if local is not None else Path("/data")
 
 
 @contextmanager
@@ -76,16 +87,16 @@ def item_outputs_exist(item: T, output_key_fn: OutputKeyFn[T]) -> bool:
 def _s3_client():
     return boto3.client(
         "s3",
-        endpoint_url=settings.aws_endpoint_url,
-        aws_access_key_id=require_cloud_setting("AWS_ACCESS_KEY_ID", settings.aws_access_key_id),
+        endpoint_url=secrets.aws_endpoint_url,
+        aws_access_key_id=require_cloud_setting("AWS_ACCESS_KEY_ID", secrets.aws_access_key_id),
         aws_secret_access_key=require_cloud_setting(
-            "AWS_SECRET_ACCESS_KEY", settings.aws_secret_access_key
+            "AWS_SECRET_ACCESS_KEY", secrets.aws_secret_access_key
         ),
     )
 
 
 def _bucket_name() -> str:
-    return require_cloud_setting("NEBIUS_BUCKET_NAME", settings.nebius_bucket_name)
+    return require_cloud_setting("NEBIUS_BUCKET_NAME", secrets.nebius_bucket_name)
 
 
 def download_from_storage(object_key: str, local_path: Path) -> None:

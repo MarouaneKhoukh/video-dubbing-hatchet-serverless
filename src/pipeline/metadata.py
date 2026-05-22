@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel
 
-from pipeline.config import settings
+from pipeline.config import config
 from pipeline.paths import (
     RUNS_PREFIX,
-    build_run_items_from_stems,
     task_manifest_container_path,
     task_manifest_object_key,
     task_report_object_key,
@@ -29,9 +29,11 @@ StageStatus = Literal["completed", "failed", "skipped"]
 _MANIFEST_TOP_LEVEL_KEYS = ("task", "run_id", "config", "force", "target_lang")
 
 _TASK_REQUIRED_CONFIG: dict[str, tuple[str, ...]] = {
+    "extract": (),
     "transcribe": ("model", "device", "batch_size"),
     "translate": ("model", "device", "batch_size"),
     "tts": ("voice", "lang", "device", "repo", "batch_size"),
+    "remux": (),
 }
 
 # Upstream task report field → artifact directory to scan as fallback.
@@ -55,6 +57,7 @@ class TaskManifest(BaseModel):
     created_at: str
     executor: str | None = None
     config: dict[str, Any]
+    video_keys: list[str] | None = None  # only populated for extract; downstream stages derive inputs from upstream reports
 
 
 def read_task_report(run_id: str, task: str) -> dict[str, Any] | None:
@@ -117,20 +120,14 @@ def resolve_manifest_stems(manifest: dict[str, Any]) -> list[str]:
     )
 
 
-# ── Container batch job helpers ───────────────────────────────────────────────
+# ── Container job helpers ─────────────────────────────────────────────────────
 
 
-def parse_manifest_argv() -> tuple[Path, int]:
-    """Parse ``<manifest.json> [<chunk_idx>]`` or a single combined arg from Nebius."""
+def manifest_path_from_argv() -> Path:
+    """Return the manifest path passed as the container's first argv."""
     if len(sys.argv) < 2:
-        raise SystemExit("usage: <job>.py <task_manifest.json> [chunk_idx]")
-    if len(sys.argv) >= 3:
-        return Path(sys.argv[1]), int(sys.argv[2])
-    combined = sys.argv[1].strip()
-    if " " in combined:
-        path_str, idx_str = combined.split(maxsplit=1)
-        return Path(path_str), int(idx_str)
-    return Path(combined), 0
+        raise SystemExit("usage: <job>.py <task_manifest.json>")
+    return Path(sys.argv[1].strip())
 
 
 def _manifest_object_key(path: Path) -> str:
@@ -146,24 +143,6 @@ def load_manifest(path: Path) -> dict[str, Any]:
     if data is None:
         raise FileNotFoundError(f"manifest not found: {path}")
     return data
-
-
-def chunk_items(items: list[dict[str, str]], batch_size: int, chunk_idx: int) -> list[dict[str, str]]:
-    if batch_size < 1:
-        raise ValueError(f"batch_size must be >= 1, got {batch_size}")
-    start = chunk_idx * batch_size
-    if start >= len(items):
-        raise IndexError(f"chunk_idx {chunk_idx} out of range for {len(items)} items")
-    return items[start : start + batch_size]
-
-
-def resolve_chunk(manifest: dict[str, Any], chunk_idx: int) -> list[dict[str, str]]:
-    """Return per-file item dicts for one manifest batch chunk."""
-    runtime = parse_task_runtime(manifest, manifest["task"])
-    stems = resolve_manifest_stems(manifest)
-    items = build_run_items_from_stems(stems, runtime["run_id"])
-    batch_size = int(runtime["config"]["batch_size"])
-    return chunk_items(items, batch_size, chunk_idx)
 
 
 def parse_task_runtime(manifest: dict[str, Any], task: str) -> dict[str, Any]:
@@ -243,18 +222,18 @@ def resolve_task_device(task: str) -> str:
     """Runtime device for a task manifest (``cpu`` / ``cuda``)."""
     if task in ("extract", "remux"):
         return "cpu"
-    task_cfg = getattr(settings, task)
+    task_cfg = getattr(config.pipeline, task)
     configured = getattr(task_cfg, "device", "cuda")
-    return configured if task_cfg.compute.gpu else "cpu"
+    return configured if task_cfg.compute.platform.startswith("gpu-") else "cpu"
 
 
 def _task_config(task: str, *, cli_overrides: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
     task_settings = {
-        "extract": settings.extract,
-        "transcribe": settings.transcribe,
-        "translate": settings.translate,
-        "tts": settings.tts,
-        "remux": settings.remux,
+        "extract": config.pipeline.extract,
+        "transcribe": config.pipeline.transcribe,
+        "translate": config.pipeline.translate,
+        "tts": config.pipeline.tts,
+        "remux": config.pipeline.remux,
     }
     if task not in task_settings:
         raise ValueError(f"Unknown task {task!r}")
@@ -290,6 +269,7 @@ def build_task_manifest(
         created_at=utc_now(),
         executor=executor,
         config=_task_config(task, cli_overrides=cli_overrides),
+        video_keys=list(run.video_keys) if task == "extract" else None,
     )
 
 
@@ -311,11 +291,6 @@ def write_task_manifest(
     return task_manifest_container_path(run.run_id, task)
 
 
-def job_args_for_chunk(run_id: str, task: str, chunk_idx: int) -> str:
-    """Container argv tail: task manifest path + chunk index."""
-    return f"{task_manifest_container_path(run_id, task)} {chunk_idx}"
-
-
 def _stage_status(result: dict[str, Any], *, failed: bool) -> StageStatus:
     if failed:
         return "failed"
@@ -331,8 +306,127 @@ def _stage_status(result: dict[str, Any], *, failed: bool) -> StageStatus:
     return "completed"
 
 
+# Output key field per task (what each stage produces).
+_OUTPUT_FIELDS: dict[str, tuple[str, ...]] = {
+    "extract": ("audio_key",),
+    "transcribe": ("transcript_key", "aligned_key"),
+    "translate": ("translated_key",),
+    "tts": ("dubbed_key",),
+    "remux": ("output_key",),
+}
+
+
+def expected_output_keys(run: PipelineRun, task: str) -> list[str]:
+    """All artifact object keys this stage is expected to produce for *run*.
+
+    Used by Hatchet pre-flight to decide whether work is needed: scan upstream
+    report (or ``run.video_keys`` for extract) to derive stems, then build the
+    full output-key list. Returns an empty list when upstream hasn't run.
+    """
+    from pipeline.paths import build_run_items, build_run_items_from_stems
+
+    if task not in _OUTPUT_FIELDS:
+        raise ValueError(f"Unknown task {task!r}")
+
+    if task == "extract":
+        items = build_run_items(list(run.video_keys), run.run_id)
+    else:
+        stems = resolve_upstream_stems(run.run_id, task)
+        if not stems:
+            return []
+        items = build_run_items_from_stems(
+            stems,
+            run.run_id,
+            video_keys_by_stem=video_keys_by_stem(run.run_id) if task == "remux" else None,
+        )
+
+    keys: list[str] = []
+    for item in items:
+        for field in _OUTPUT_FIELDS[task]:
+            keys.append(item[field])
+    return keys
+
+
+def write_skipped_report(run: PipelineRun, task: str, expected: list[str]) -> dict[str, Any]:
+    """Emit a status='skipped' report when Hatchet pre-flight finds nothing to do.
+
+    Shape mirrors the report a successful ``run_task`` would write, so downstream
+    pre-flight (which reads upstream report outputs) keeps working.
+    """
+    started = utc_now()
+    field = _OUTPUT_FIELDS[task][0]
+    outputs_key = {
+        "extract": "audio_keys",
+        "transcribe": "transcript_keys",
+        "translate": "translated_keys",
+        "tts": "dubbed_keys",
+        "remux": "output_keys",
+    }[task]
+    # For transcribe we also expose aligned_keys (paired with transcript_keys).
+    extra: dict[str, list[str]] = {}
+    if task == "transcribe":
+        n = len(expected) // 2
+        # expected alternates [transcript, aligned] per stem
+        extra["aligned_keys"] = expected[1::2]
+        result_keys = expected[0::2]
+    else:
+        result_keys = expected
+
+    result: dict[str, Any] = {outputs_key: result_keys, **extra}
+    if task == "extract":
+        result["video_keys"] = list(run.video_keys)
+        result["stems"] = [Path(k).stem for k in result_keys]
+
+    timing = {
+        "task": task,
+        "total_files": len(result_keys),
+        "processed_files": 0,
+        "skipped_files": len(result_keys),
+        "wall_s": 0.0,
+        "per_file_s": 0.0,
+    }
+    result["timing"] = timing
+    write_task_report(run.run_id, run.batch_id, task, result, started_at=started)
+    return result
+
+
+def make_timing(task: str, *, total: int, processed: int, skipped: int, t0: float) -> dict[str, Any]:
+    """Build the per-task timing dict embedded in a report."""
+    wall_s = round(time.perf_counter() - t0, 2)
+    per_file_s = round(wall_s / processed, 2) if processed else 0.0
+    return {
+        "task": task,
+        "total_files": total,
+        "processed_files": processed,
+        "skipped_files": skipped,
+        "wall_s": wall_s,
+        "per_file_s": per_file_s,
+    }
+
+
+def record_task_result(
+    config: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    started_at: str,
+    failed: bool = False,
+    error: str | None = None,
+) -> None:
+    """Convenience: pull run_id/batch_id/task from a manifest dict and write the report."""
+    write_task_report(
+        config["run_id"],
+        config["batch_id"],
+        config["task"],
+        result,
+        started_at=started_at,
+        failed=failed,
+        error=error,
+    )
+
+
 def write_task_report(
-    run: PipelineRun,
+    run_id: str,
+    batch_id: str,
     task: str,
     result: dict[str, Any],
     *,
@@ -345,14 +439,14 @@ def write_task_report(
     outputs = {key: value for key, value in result.items() if key != "timing"}
     status = _stage_status(result, failed=failed)
 
-    manifest_key = task_manifest_object_key(run.run_id, task)
+    manifest_key = task_manifest_object_key(run_id, task)
     manifest = read_json(manifest_key)
     device = manifest.get("config", {}).get("device") if manifest else None
 
     report: dict[str, Any] = {
         "task": task,
-        "run_id": run.run_id,
-        "batch_id": run.batch_id,
+        "run_id": run_id,
+        "batch_id": batch_id,
         "status": status,
         "device": device,
         "started_at": started_at,
@@ -363,4 +457,4 @@ def write_task_report(
         "outputs": outputs,
         "error": error,
     }
-    upload_json(report, task_report_object_key(run.run_id, task))
+    upload_json(report, task_report_object_key(run_id, task))
