@@ -429,7 +429,7 @@ flowchart LR
     tts --> remux
 ```
 
-Each Hatchet task at L5 is **one** Nebius serverless job (no fan-out today; the `max_concurrent` knob in `config.stages.<stage>` is a forward-looking placeholder — see [.dev/spec.md](.dev/spec.md) Phase 4). Per-file idempotency inside `run_task` makes preempted-then-retried jobs cheap: only the files that didn't finish get reprocessed.
+Each Hatchet task at L5 launches **one or more** Nebius serverless jobs. When `config.stages.<stage>.max_concurrent == 1` (the default for CPU stages extract/remux), it's one job processing all files. When `> 1`, the workflow chunks inputs by `config.pipeline.<stage>.batch_size` and dispatches up to `max_concurrent` parallel jobs (`asyncio.gather` + `Semaphore`). Per-file idempotency inside `run_task` makes preempted-then-retried jobs cheap: only the files that didn't finish get reprocessed.
 
 Hatchet preemption recovery: `create_and_wait` raises `RuntimeError` on Nebius `ERROR` state → Hatchet retries the task → pre-flight on retry sees the partial S3 state → fresh Nebius job processes only missing files. Cancellation cleanup: any abnormal exit from `create_and_wait` (Hatchet timeout, worker shutdown, our polling timeout) cancels the Nebius job via `JobServiceClient.cancel(...)` under `asyncio.shield` before re-raising. Nebius stops billing once the job reaches `CANCELLED`.
 
@@ -448,7 +448,7 @@ src/
     storage.py            ← S3 + local fs I/O; use_local_artifacts contextvar; data_root()
     config.py             ← HatchetConfig (orchestrator + nested PipelineConfig); defaults in code
     cost.py               ← preset → $/min table, cost estimation
-    batch.py              ← chunking helper for fan-out (forward-looking)
+    batch.py              ← chunking helper used by the workflow's fan-out branch
     utils.py              ← utc_now, Rich console + logging helpers
   jobs/
     extract.py            ← ffmpeg per file
@@ -517,7 +517,7 @@ Naming: on disk it's a **manifest** JSON (`runs/{run_id}/manifests/<task>.json`)
 ```
 
 - `video_keys` is populated **only for extract** (so the standalone container knows what to process). Downstream stages derive inputs from the upstream report.
-- `batch_size` is a forward-looking knob; today no runtime code reads it. It changes the manifest fingerprint and therefore the cache key.
+- `batch_size` controls fan-out chunk size: when `config.stages.<stage>.max_concurrent > 1`, the workflow splits inputs into chunks of this many files and dispatches one Nebius job per chunk (`asyncio.gather` + `Semaphore` to cap parallelism). It also participates in the manifest fingerprint / cache key.
 - Orchestration knobs (`max_concurrent`, `retries`) are **not** in the per-stage manifest — they're Hatchet-side, kept on `config.stages.<stage>` and consumed at workflow registration.
 
 Container argv: `/data/runs/{run_id}/manifests/<task>.json` (one string).
@@ -595,9 +595,9 @@ The env-var tree has three prefixes:
 | `pipeline.<stage>.compute.job_disk_gb` | `PIPELINE__TRANSCRIBE__COMPUTE__JOB_DISK_GB=500` | Network SSD on the Nebius job |
 | `pipeline.<stage>.model` | `PIPELINE__TRANSCRIBE__MODEL=large-v3` | Model selection (Whisper / NLLB / Kokoro) |
 | `pipeline.<stage>.device` | `PIPELINE__TRANSCRIBE__DEVICE=cuda` or `--device cpu` | Torch device |
-| `pipeline.<stage>.batch_size` | `PIPELINE__TRANSCRIBE__BATCH_SIZE=32` | Forward-looking (Phase 4) |
+| `pipeline.<stage>.batch_size` | `PIPELINE__TRANSCRIBE__BATCH_SIZE=32` | Files per Nebius job when fan-out is active (`max_concurrent > 1`) |
 | `pipeline.tts.voice / lang / repo` | `PIPELINE__TTS__VOICE=af_heart`, `PIPELINE__TTS__LANG=a`, `PIPELINE__TTS__REPO=…` | Kokoro voice / language |
-| `stages.<stage>.max_concurrent` | `STAGES__TRANSCRIBE__MAX_CONCURRENT=4` | Parallel Nebius jobs cap (Phase 4) |
+| `stages.<stage>.max_concurrent` | `STAGES__TRANSCRIBE__MAX_CONCURRENT=4` | Parallel Nebius jobs cap. `1` (default for CPU stages) = single job; `>1` enables fan-out by `batch_size`. |
 | `stages.<stage>.retries` | `STAGES__TRANSCRIBE__RETRIES=5` | Hatchet retries for this stage |
 | `workflow_name` | `WORKFLOW_NAME=…` | Hatchet workflow name (dashboard label) |
 | `timeout_buffer_s` | `TIMEOUT_BUFFER_S=900` | Cold start + SDK overhead, added to `job_timeout_min` |
