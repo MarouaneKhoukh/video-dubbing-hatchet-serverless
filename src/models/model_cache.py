@@ -15,6 +15,24 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+# ── HF Hub env vars MUST be set before huggingface_hub is imported ───────────
+# ``huggingface_hub.constants`` captures these at module-import time and never
+# re-reads them. If we set them inside ``configure()`` they run AFTER imports
+# like ``import whisperx`` / ``from faster_whisper import WhisperModel`` have
+# already imported huggingface_hub — too late.
+#
+# Setting them at the top of model_cache.py means the moment any job file does
+# ``import model_cache``, these are in os.environ before HF Hub gets imported
+# transitively. Belt-and-suspenders: the Dockerfile ENV also sets them so they
+# survive even if a future job reorders its imports.
+#
+# Why disable hf_xet on Nebius: the Rust transfer accelerator's
+# tracing-appender tries to create a rolling log file on import, which fails
+# with "Operation not permitted" on the FUSE-mounted /data. Falling back to
+# the regular HTTP downloader works fine (slower, but functional on FUSE).
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
 
 def _host_default_cache() -> Path:
     """Default cache when ``MODEL_CACHE_DIR`` is unset (host dev; container fallback)."""
@@ -102,6 +120,16 @@ def configure() -> Path:
     os.environ.setdefault("HF_HOME", str(hf_home))
     os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(hf_hub))
     os.environ.setdefault("TORCH_HOME", str(torch_home))
+
+    # huggingface_hub ships ``hf_xet`` (Rust transfer accelerator) as a transitive
+    # dep. Its tracing-appender logger tries to create a rolling log file on
+    # import; that fails with "Operation not permitted" on the FUSE-mounted /data
+    # because object-storage mounts don't support the chmod/rename pattern the
+    # appender expects. Force the legacy URL-based downloader, which works fine
+    # on FUSE (slower but functional). Same env var also covers the symlink
+    # warning HF emits on non-POSIX filesystems.
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
     data_mount = Path("/data")
     if data_mount.is_dir():

@@ -9,13 +9,17 @@ Invocation:
 import time
 from pathlib import Path
 
-import torch
-from transformers import AutoModelForSeq2SeqLM, NllbTokenizer
-
+# IMPORTANT: import model_cache BEFORE transformers/torch. transformers
+# transitively imports huggingface_hub, which captures HF_HUB_DISABLE_XET at
+# its own module-import time. model_cache sets that env var at *its* module
+# top, so it must be imported first to take effect.
 try:
     import model_cache
 except ImportError:
     from models import model_cache
+
+import torch
+from transformers import AutoModelForSeq2SeqLM, NllbTokenizer
 
 from pipeline.metadata import (
     config_str,

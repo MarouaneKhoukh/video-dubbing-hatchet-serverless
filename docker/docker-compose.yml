@@ -1,4 +1,18 @@
-version: "3.8"
+## Self-hosted Hatchet for local development.
+#
+# Uses the official ``hatchet-lite`` all-in-one image (engine + API + frontend
+# in one container). Simpler and more reliable than the older 3-service split
+# (separate engine / api / frontend images had a fragile env-var contract that
+# broke between versions).
+#
+# Usage:
+#   docker compose -f docker/docker-compose.yml up -d
+#   open http://localhost:8888
+#   sign up (email auto-verified, no SMTP needed) → create an API token →
+#   paste into .env as HATCHET_CLIENT_TOKEN
+#
+# To wipe and start fresh:
+#   docker compose -f docker/docker-compose.yml down -v
 
 services:
   postgres:
@@ -15,45 +29,50 @@ services:
       timeout: 5s
       retries: 5
 
-  hatchet-engine:
-    image: ghcr.io/hatchet-dev/hatchet/hatchet-engine:latest
+  rabbitmq:
+    image: rabbitmq:3-management
+    hostname: rabbitmq
     environment:
-      DATABASE_URL: postgresql://hatchet:hatchet@postgres:5432/hatchet
-      SERVER_TLS_STRATEGY: none
-      SERVER_AUTH_COOKIE_SECRETS: "supersecretcookiesecret1 supersecretcookiesecret2"
+      RABBITMQ_DEFAULT_USER: user
+      RABBITMQ_DEFAULT_PASS: password
+    healthcheck:
+      test: ["CMD", "rabbitmqctl", "status"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  hatchet-lite:
+    image: ghcr.io/hatchet-dev/hatchet/hatchet-lite:latest
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      RABBITMQ_DEFAULT_USER: user
+      RABBITMQ_DEFAULT_PASS: password
+      RABBITMQ_URL: amqp://user:password@rabbitmq:5672
+      DATABASE_URL: postgresql://hatchet:hatchet@postgres:5432/hatchet?sslmode=disable
+      DATABASE_POSTGRES_PORT: "5432"
+      DATABASE_POSTGRES_HOST: postgres
+      SERVER_TASKQUEUE_RABBITMQ_URL: amqp://user:password@rabbitmq:5672
       SERVER_AUTH_COOKIE_DOMAIN: localhost
+      SERVER_AUTH_COOKIE_INSECURE: "t"
       SERVER_GRPC_BIND_ADDRESS: "0.0.0.0"
-      SERVER_GRPC_PORT: 7077
+      SERVER_GRPC_INSECURE: "t"
       SERVER_GRPC_BROADCAST_ADDRESS: "localhost:7077"
-      SERVER_URL: "http://localhost:8080"
+      SERVER_URL: "http://localhost:8888"
+      # No SMTP wired up in this local stack — auto-verify new signups so the
+      # frontend doesn't trap users on the verify-email page.
       SERVER_AUTH_EMAIL_VERIFY_ENABLED: "false"
-    depends_on:
-      postgres:
-        condition: service_healthy
     ports:
-      - "7077:7077"
-
-  hatchet-api:
-    image: ghcr.io/hatchet-dev/hatchet/hatchet-api:latest
-    environment:
-      DATABASE_URL: postgresql://hatchet:hatchet@postgres:5432/hatchet
-      SERVER_TLS_STRATEGY: none
-      SERVER_AUTH_COOKIE_SECRETS: "supersecretcookiesecret1 supersecretcookiesecret2"
-      SERVER_AUTH_COOKIE_DOMAIN: localhost
-      SERVER_URL: "http://localhost:8080"
-      SERVER_AUTH_EMAIL_VERIFY_ENABLED: "false"
-    depends_on:
-      postgres:
-        condition: service_healthy
-    ports:
-      - "8080:8080"
-
-  hatchet-frontend:
-    image: ghcr.io/hatchet-dev/hatchet/hatchet-frontend:latest
-    environment:
-      VITE_HATCHET_API_URL: "http://localhost:8080"
-    ports:
-      - "8090:80"
+      - "8888:8888"   # combined web UI + REST API
+      - "7077:7077"   # gRPC (workers + trigger CLI connect here)
+    volumes:
+      - hatchet_lite_certs:/hatchet/certs
+      - hatchet_lite_config:/hatchet/config
 
 volumes:
   postgres_data:
+  hatchet_lite_certs:
+  hatchet_lite_config:

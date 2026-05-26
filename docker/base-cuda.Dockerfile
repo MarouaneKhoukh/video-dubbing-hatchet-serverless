@@ -11,8 +11,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     UV_PROJECT_ENVIRONMENT=/app/.venv \
     PATH="/app/.venv/bin:$PATH"
 
+# Install libcudnn8 alongside the cuDNN 9 the base image ships. ctranslate2
+# <4.5 (pinned transitively via whisperx==3.3.1) links against cuDNN 8 — see
+# .dev/talk.md bug #7. The nvidia/cuda image's apt sources include cudnn8.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl \
+    libcudnn8 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/

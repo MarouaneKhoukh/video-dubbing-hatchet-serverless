@@ -47,15 +47,30 @@ def run_stage(
 ) -> dict:
     """Run one pipeline stage in-process. Returns the report payload."""
     from pipeline.metadata import build_task_manifest
-    from pipeline.paths import task_manifest_object_key
+    from pipeline.paths import task_manifest_key
     from pipeline.storage import upload_json
 
     log(f"=== {stage} ===")
+
+    # Pre-flight: warn (don't fail) if any required model isn't in the local
+    # cache. HF Hub will auto-download on first use, but the operator probably
+    # wants to know before a 30-60s download blocks the stage. POSIX host, no
+    # FUSE friction — so unlike the workflow.py path this is a heads-up, not
+    # a hard stop. CPU stages (extract, remux) skip the check (no model deps).
+    from models.preflight import pre_flight_check
+    present, missing = pre_flight_check(stage, location="local")
+    if not present:
+        logger.warning(
+            f"[{stage}] model(s) not in local cache: {missing}. "
+            f"HF Hub will download on first use (~30-60s extra cold start). "
+            f"Pre-warm: python scripts/sync_models.py"
+        )
+
     manifest = build_task_manifest(
         run, stage, cli_overrides=cli_overrides, executor="python"
     )
     config = manifest.model_dump()
-    upload_json(config, task_manifest_object_key(run.run_id, stage))
+    upload_json(config, task_manifest_key(run.run_id, stage))
     module = _job_module(stage)
     return module.run_task(config)
 

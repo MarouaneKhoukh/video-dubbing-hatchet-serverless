@@ -17,7 +17,7 @@ def repo_data_dir() -> Path:
 # ── Input keys (video sources) ───────────────────────────────────────────────
 
 
-def normalize_bucket_key(path: str) -> str:
+def _normalize_bucket_key(path: str) -> str:
     """Normalize to a bucket-relative key (no leading slash, no ``data/`` host prefix)."""
     key = path.strip().replace("\\", "/")
     if key.startswith("./"):
@@ -29,7 +29,7 @@ def normalize_bucket_key(path: str) -> str:
     return key.lstrip("/")
 
 
-def is_video_key(key: str) -> bool:
+def _is_video_key(key: str) -> bool:
     return Path(key).suffix.lower() in VIDEO_EXTS
 
 
@@ -37,16 +37,16 @@ def _scan_bucket_prefix(prefix: str) -> list[str]:
     """List video keys under a bucket prefix."""
     from pipeline.storage import list_objects
 
-    normalized = normalize_bucket_key(prefix)
+    normalized = _normalize_bucket_key(prefix)
     if normalized and not normalized.endswith("/"):
         normalized = f"{normalized}/"
     keys = list_objects(normalized)
-    return sorted(k for k in keys if is_video_key(k))
+    return sorted(k for k in keys if _is_video_key(k))
 
 
 def _scan_local_prefix(prefix: str, data_root: Path) -> list[str]:
     """List video keys under a host ``data/`` directory."""
-    key = normalize_bucket_key(prefix)
+    key = _normalize_bucket_key(prefix)
     prefix_path = data_root / key
     if not prefix_path.exists():
         raise ValueError(f"No video files found under prefix {key!r}")
@@ -54,7 +54,7 @@ def _scan_local_prefix(prefix: str, data_root: Path) -> list[str]:
     keys = sorted(
         p.relative_to(data_root).as_posix()
         for p in scan_root.rglob("*")
-        if p.is_file() and is_video_key(p.name)
+        if p.is_file() and _is_video_key(p.name)
     )
     if not keys:
         raise ValueError(f"No video files found under prefix {key!r}")
@@ -74,11 +74,11 @@ def resolve_video_keys(source: str, *, data_root: Path | None = None) -> list[st
 
     When ``data_root`` is set, scan the host ``data/`` tree instead of the bucket.
     """
-    key = normalize_bucket_key(source)
+    key = _normalize_bucket_key(source)
     if not key:
         raise ValueError("Input path is empty")
 
-    if is_video_key(key):
+    if _is_video_key(key):
         if data_root is not None and not (data_root / key).is_file():
             raise ValueError(f"Video file not found: {data_root / key}")
         return [key]
@@ -95,33 +95,51 @@ def resolve_video_keys(source: str, *, data_root: Path | None = None) -> list[st
 # ── Output keys (run artifacts) ──────────────────────────────────────────────
 
 
-def artifact_key(run_id: str, task: str, filename: str) -> str:
+def _artifact_key(run_id: str, task: str, filename: str) -> str:
     """Object key: ``runs/{run_id}/{task}/{filename}``."""
     return f"{RUNS_PREFIX}/{run_id}/{task}/{filename}"
 
 
-def task_manifest_object_key(run_id: str, task: str) -> str:
+def task_manifest_key(run_id: str, task: str) -> str:
     return f"{RUNS_PREFIX}/{run_id}/manifests/{task}.json"
 
 
 def task_manifest_container_path(run_id: str, task: str) -> str:
-    return f"/data/{task_manifest_object_key(run_id, task)}"
+    return f"/data/{task_manifest_key(run_id, task)}"
 
 
-def task_report_object_key(run_id: str, task: str) -> str:
+def task_chunk_manifest_key(run_id: str, task: str, chunk_index: int) -> str:
+    return f"{RUNS_PREFIX}/{run_id}/manifests/{task}__chunk-{chunk_index:03d}.json"
+
+
+def task_chunk_manifest_container_path(run_id: str, task: str, chunk_index: int) -> str:
+    return f"/data/{task_chunk_manifest_key(run_id, task, chunk_index)}"
+
+
+def task_report_key(run_id: str, task: str) -> str:
     return f"{RUNS_PREFIX}/{run_id}/reports/{task}.json"
 
 
-def build_run_item(stem: str, run_id: str, *, video_key: str = "") -> dict[str, str]:
+def task_orch_report_key(run_id: str, task: str) -> str:
+    """Orchestrator-side sidecar report — per-chunk Nebius job records + cost."""
+    return f"{RUNS_PREFIX}/{run_id}/reports/{task}__orch.json"
+
+
+def run_summary_key(run_id: str) -> str:
+    """Final aggregated report for one batch run — cost rollup across all stages."""
+    return f"{RUNS_PREFIX}/{run_id}/run_summary.json"
+
+
+def _build_run_item(stem: str, run_id: str, *, video_key: str = "") -> dict[str, str]:
     return {
         "video_key": video_key,
         "stem": stem,
-        "audio_key": artifact_key(run_id, "extract", f"{stem}.wav"),
-        "transcript_key": artifact_key(run_id, "transcribe", f"{stem}.txt"),
-        "aligned_key": artifact_key(run_id, "transcribe", f"{stem}_aligned.json"),
-        "translated_key": artifact_key(run_id, "translate", f"{stem}.txt"),
-        "dubbed_key": artifact_key(run_id, "tts", f"{stem}.wav"),
-        "output_key": artifact_key(run_id, "remux", f"{stem}.mp4"),
+        "audio_key": _artifact_key(run_id, "extract", f"{stem}.wav"),
+        "transcript_key": _artifact_key(run_id, "transcribe", f"{stem}.txt"),
+        "aligned_key": _artifact_key(run_id, "transcribe", f"{stem}_aligned.json"),
+        "translated_key": _artifact_key(run_id, "translate", f"{stem}.txt"),
+        "dubbed_key": _artifact_key(run_id, "tts", f"{stem}.wav"),
+        "output_key": _artifact_key(run_id, "remux", f"{stem}.mp4"),
     }
 
 
@@ -132,7 +150,7 @@ def build_run_items_from_stems(
     video_keys_by_stem: dict[str, str] | None = None,
 ) -> list[dict[str, str]]:
     vk = video_keys_by_stem or {}
-    return [build_run_item(stem, run_id, video_key=vk.get(stem, "")) for stem in stems]
+    return [_build_run_item(stem, run_id, video_key=vk.get(stem, "")) for stem in stems]
 
 
 def build_run_items(video_keys: list[str], run_id: str) -> list[dict[str, str]]:
@@ -140,5 +158,5 @@ def build_run_items(video_keys: list[str], run_id: str) -> list[dict[str, str]]:
     items: list[dict[str, str]] = []
     for video_key in video_keys:
         stem = Path(video_key).stem
-        items.append(build_run_item(stem, run_id, video_key=video_key))
+        items.append(_build_run_item(stem, run_id, video_key=video_key))
     return items

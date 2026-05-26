@@ -12,12 +12,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import typer
-from rich.panel import Panel
-from rich.table import Table
 
-from hatchet.console import get_console
 from pipeline.config import get_config
 from pipeline.paths import resolve_video_keys
+from pipeline.utils import print_run_summary
 
 if TYPE_CHECKING:
     from pipeline.run import PipelineRun
@@ -35,34 +33,18 @@ def _root() -> None:
 
 
 def _print_summary(run: PipelineRun, video_keys: list[str], run_url: str | None = None) -> None:
-    console = get_console()
-    mode = "single" if len(video_keys) == 1 else f"batch ({len(video_keys)} files)"
-
-    table = Table(show_header=False, box=None, padding=(0, 1))
-    table.add_column(style="dim")
-    table.add_column()
-    table.add_row("Mode", mode)
-    table.add_row("Language", run.target_lang)
-    table.add_row("Run ID", run.run_id)
-    table.add_row("Batch ID", run.batch_id)
-    table.add_row("Force", str(run.force))
-    table.add_row("Output prefix", f"runs/{run.run_id}/")
-
-    if len(video_keys) <= 10:
-        for vk in video_keys:
-            table.add_row("Input", vk)
-    else:
-        for vk in video_keys[:5]:
-            table.add_row("Input", vk)
-        table.add_row("", f"… and {len(video_keys) - 5} more")
-
     footer = "\n[bold green]Run started![/bold green]"
     if run_url:
         footer += f"\nWorkflow ID: {run_url}"
     footer += "\n[link=https://cloud.hatchet.run]https://cloud.hatchet.run[/link]"
 
-    console.print(Panel(table, title="Triggering pipeline", border_style="blue"))
-    console.print(footer)
+    print_run_summary(
+        run, video_keys,
+        title="Triggering pipeline",
+        border_style="blue",
+        extra_rows=[("Batch ID", run.batch_id)],
+        footer=footer,
+    )
 
 
 def run_trigger(

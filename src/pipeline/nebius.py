@@ -12,6 +12,7 @@ Key design:
 
 import asyncio
 import logging
+import time
 from datetime import timedelta
 
 from nebius.sdk import SDK
@@ -38,6 +39,19 @@ _TERMINAL_STATES = {
 }
 
 
+class NebiusJobError(RuntimeError):
+    """Nebius job ended in a non-COMPLETED terminal state.
+
+    Carries the full ``record`` (job_id, created_at_s, state_transitions,
+    terminal_state) so callers can attach per-job cost/timeline data to their
+    stage report even on the failure path.
+    """
+
+    def __init__(self, message: str, *, record: dict):
+        super().__init__(message)
+        self.record = record
+
+
 _sdk: SDK | None = None
 
 
@@ -49,7 +63,7 @@ def _get_sdk() -> SDK:
     return _sdk
 
 
-async def create_nebius_job(
+async def _create_nebius_job(
     name: str,
     image: str,
     args: str,
@@ -99,34 +113,52 @@ async def create_nebius_job(
     return job_id
 
 
-async def wait_for_job_completion(
+async def _wait_for_job_completion(
     job_id: str,
     poll_interval: int = 15,
     max_polls: int = 120,
 ) -> dict:
+    """Poll a Nebius job until terminal state, recording state-transition timeline.
+
+    Returns a record on COMPLETED. Raises ``NebiusJobError`` (carrying the same
+    record on ``.record``) for non-COMPLETED terminal states so callers can both
+    propagate the failure to Hatchet AND extract timeline/cost data. The
+    polling cadence (default 15s) bounds the resolution of the timeline.
+    """
     sdk = _get_sdk()
     job_svc = JobServiceClient(sdk)
+
+    state_transitions: list[dict] = []
+    last_state = None
 
     for attempt in range(max_polls):
         response = await job_svc.get(GetJobRequest(id=job_id))
         state = response.status.state
         state_name = state.name
 
+        if state != last_state:
+            state_transitions.append({"state": state_name, "observed_at_s": time.time()})
+            last_state = state
+
         logger.info(f"Job {job_id} | state: {state_name} | poll {attempt + 1}/{max_polls}")
 
         if state in _TERMINAL_STATES:
+            record = {
+                "job_id": job_id,
+                "terminal_state": state_name,
+                "state_transitions": state_transitions,
+            }
             if state == JobStatus.State.COMPLETED:
-                return {"job_id": job_id, "state": state_name}
-
+                return record
             if state == JobStatus.State.ERROR:
-                # Preemption case - raise so Hatchet retries the step
-                raise RuntimeError(
+                raise NebiusJobError(
                     f"Job {job_id} was preempted (state={state_name}). "
-                    "Hatchet will retry on a new GPU."
+                    "Hatchet will retry on a new GPU.",
+                    record=record,
                 )
-
-            raise RuntimeError(
-                f"Job {job_id} failed with state: {state_name}"
+            raise NebiusJobError(
+                f"Job {job_id} failed with state: {state_name}",
+                record=record,
             )
 
         await asyncio.sleep(poll_interval)
@@ -134,7 +166,7 @@ async def wait_for_job_completion(
     raise TimeoutError(f"Job {job_id} did not complete within the timeout period")
 
 
-async def cancel_nebius_job(
+async def _cancel_nebius_job(
     job_id: str,
     *,
     poll_interval: int = 5,
@@ -181,7 +213,16 @@ async def create_and_wait(
     job: Compute,
     container_command: str | None = None,
 ) -> dict:
-    job_id = await create_nebius_job(
+    """Submit a Nebius job and wait for terminal state.
+
+    Returns a record ``{job_id, created_at_s, terminal_state, state_transitions,
+    platform, preset, preemptible}`` on COMPLETED. Raises ``NebiusJobError`` on
+    non-COMPLETED terminal states (the exception's ``.record`` carries the same
+    data for failure-path reporting). On outer cancel / Hatchet timeout, cancels
+    the cloud job and re-raises the original exception (no record attached).
+    """
+    created_at_s = time.time()
+    job_id = await _create_nebius_job(
         name=name,
         image=image,
         args=args,
@@ -189,18 +230,25 @@ async def create_and_wait(
         container_command=container_command,
     )
     try:
-        return await wait_for_job_completion(job_id)
+        record = await _wait_for_job_completion(job_id)
+    except NebiusJobError as exc:
+        # Enrich the record with submission context before propagating.
+        exc.record.update({
+            "created_at_s": created_at_s,
+            "platform": job.platform,
+            "preset": job.preset,
+            "preemptible": job.preemptible,
+        })
+        raise
     except BaseException as exc:
-        # Anything that exits the wait abnormally — Hatchet timeout / outer task
-        # cancel (CancelledError), our polling TimeoutError, Nebius ERROR/FAILED
-        # raise, network errors — should cancel the cloud job before propagating.
-        # asyncio.shield keeps the cleanup running even when we're being cancelled.
+        # Outer cancel / Hatchet timeout / polling TimeoutError / network — cancel
+        # the cloud job before propagating. asyncio.shield keeps cleanup running.
         cancel_reason = type(exc).__name__
         logger.warning(
             f"create_and_wait exiting via {cancel_reason} — cancelling Nebius job {job_id}"
         )
         try:
-            await asyncio.shield(cancel_nebius_job(job_id))
+            await asyncio.shield(_cancel_nebius_job(job_id))
         except asyncio.CancelledError:
             # Outer cancel re-fired despite the shield. Best-effort: the shielded
             # task continues to run inside Nebius; we just stop waiting for it.
@@ -208,3 +256,11 @@ async def create_and_wait(
                 f"Cancel-cleanup for {job_id} interrupted by re-cancellation; job state unknown"
             )
         raise
+
+    record.update({
+        "created_at_s": created_at_s,
+        "platform": job.platform,
+        "preset": job.preset,
+        "preemptible": job.preemptible,
+    })
+    return record

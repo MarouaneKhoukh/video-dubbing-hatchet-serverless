@@ -20,18 +20,29 @@ from pipeline.metadata import (
     record_task_result,
 )
 from pipeline.paths import build_run_items
-from pipeline.storage import data_root
+from pipeline.storage import auto_configure_data_root, data_root, staged_write
 from pipeline.utils import utc_now
+
+# Wire the /data FUSE mount into pipeline.storage so manifest reads use the
+# bucket directly instead of an S3 client (no AWS creds inside the container).
+auto_configure_data_root()
 
 
 def _ffmpeg_extract(video_path: Path, audio_path: Path) -> None:
-    audio_path.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        "ffmpeg", "-i", str(video_path),
-        "-vn", "-ac", "1", "-ar", "16000",
-        "-y", str(audio_path),
-    ]
-    subprocess.run(cmd, check=True, capture_output=True)
+    # Stage WAV write in /tmp (seekable) — FUSE-mounted /data can't seek.
+    with staged_write(audio_path) as out_path:
+        cmd = [
+            "ffmpeg", "-i", str(video_path),
+            "-vn", "-ac", "1", "-ar", "16000",
+            "-y", str(out_path),
+        ]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(
+                f"ffmpeg extract failed for {video_path.name} "
+                f"(exit {e.returncode}): {e.stderr.strip()[-800:]}"
+            ) from e
 
 
 def _process_file(video_path: Path, audio_path: Path, *, force: bool) -> bool:

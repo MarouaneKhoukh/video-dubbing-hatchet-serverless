@@ -16,7 +16,7 @@
 #   scripts/docker_build.sh                                  # build all (cuda base), no push
 #   scripts/docker_build.sh --push                           # build + push all
 #   scripts/docker_build.sh --task transcribe --push         # one task
-#   scripts/docker_build.sh --skip-base                      # skip base; reuse cached video-dubbing-base:local
+#   scripts/docker_build.sh --skip-base                      # skip base; reuse cached :local, else cached registry tag, else pull mnrozhkov/video-dubbing-base:<VERSION>
 #   scripts/docker_build.sh --base cpu --no-platform         # local Mac smoke build (native arch, cached)
 #   VERSION=v0.2.0 scripts/docker_build.sh --push            # bump version
 #   REGISTRY=otheraccount scripts/docker_build.sh --push     # different Docker Hub user
@@ -38,7 +38,7 @@
 set -euo pipefail
 
 REGISTRY="${REGISTRY:-mnrozhkov}"
-VERSION="${VERSION:-v0.1.0}"
+VERSION="${VERSION:-v0.2.0}"
 BASE="${BASE:-cuda}"                 # cuda | cpu
 PLATFORM="${PLATFORM:-linux/amd64}"
 PUSH=0
@@ -101,11 +101,31 @@ log "Settings: registry=${REGISTRY} version=${VERSION} base=${BASE} platform=${U
 
 # ── Base image ────────────────────────────────────────────────────────────────
 if [ "$SKIP_BASE" -eq 1 ]; then
-    if ! docker image inspect "$BASE_LOCAL_TAG" >/dev/null 2>&1; then
-        echo "--skip-base passed but ${BASE_LOCAL_TAG} not found locally. Run without --skip-base once." >&2
-        exit 1
+    # Resolve a usable :local tag from one of (in order):
+    #   1. already-cached :local
+    #   2. already-cached registry-versioned tag → retag as :local
+    #   3. pull registry-versioned tag from Docker Hub → retag as :local
+    if docker image inspect "$BASE_LOCAL_TAG" >/dev/null 2>&1; then
+        log "Skipping base build (--skip-base); using cached ${BASE_LOCAL_TAG}"
+    elif docker image inspect "$BASE_REGISTRY_TAG" >/dev/null 2>&1; then
+        log "Found ${BASE_REGISTRY_TAG} locally; retagging as ${BASE_LOCAL_TAG}"
+        docker tag "$BASE_REGISTRY_TAG" "$BASE_LOCAL_TAG"
+    else
+        log "${BASE_LOCAL_TAG} not cached; pulling ${BASE_REGISTRY_TAG} from registry"
+        if ! docker pull "$BASE_REGISTRY_TAG"; then
+            echo "" >&2
+            echo "--skip-base passed but no base image available:" >&2
+            echo "  - ${BASE_LOCAL_TAG} not cached locally" >&2
+            echo "  - ${BASE_REGISTRY_TAG} could not be pulled from the registry" >&2
+            echo "" >&2
+            echo "Fix one of:" >&2
+            echo "  - Re-run without --skip-base to rebuild the base from source" >&2
+            echo "  - Push ${BASE_REGISTRY_TAG} from a machine that has it" >&2
+            echo "  - Check VERSION (currently ${VERSION}) matches a published base tag" >&2
+            exit 1
+        fi
+        docker tag "$BASE_REGISTRY_TAG" "$BASE_LOCAL_TAG"
     fi
-    log "Skipping base build (--skip-base); using existing ${BASE_LOCAL_TAG}"
 else
     log "Building base image: ${BASE_LOCAL_TAG} (${BASE_DOCKERFILE})"
     docker build "${platform_flag[@]}" \

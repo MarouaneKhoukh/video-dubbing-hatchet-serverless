@@ -119,7 +119,7 @@ class PipelineConfig(BaseModel):
     that happens at ``HatchetConfig`` (the top-level ``BaseSettings``)."""
 
     target_lang: str = "es"  # NLLB translate target (EN → ES); override via PIPELINE__TARGET_LANG
-    image_tag: str = "v0.1.0"  # applied to every stage's image; override via PIPELINE__IMAGE_TAG
+    image_tag: str = "v0.2.0"  # applied to every stage's image; override via PIPELINE__IMAGE_TAG
 
     extract:    ExtractConfig    = Field(default_factory=ExtractConfig)
     transcribe: TranscribeConfig = Field(default_factory=TranscribeConfig)
@@ -208,7 +208,7 @@ def get_config() -> HatchetConfig:
     return _config
 
 
-def get_secrets() -> Secrets:
+def _get_secrets() -> Secrets:
     """Return cached secrets, loading ``.env`` on first call."""
     global _secrets
     if _secrets is None:
@@ -232,7 +232,7 @@ class _ConfigProxy:
 
 class _SecretsProxy:
     def __getattr__(self, name: str) -> Any:
-        return getattr(get_secrets(), name)
+        return getattr(_get_secrets(), name)
 
 
 config = _ConfigProxy()

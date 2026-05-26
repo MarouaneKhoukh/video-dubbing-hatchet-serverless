@@ -13,13 +13,17 @@ import json
 import time
 from pathlib import Path
 
-import whisperx
-from faster_whisper import WhisperModel
-
+# IMPORTANT: import model_cache BEFORE whisperx/faster_whisper. Both
+# transitively import huggingface_hub, which captures HF_HUB_DISABLE_XET at
+# its own module-import time. model_cache sets that env var at *its* module
+# top, so it must be imported first to take effect.
 try:
     import model_cache
 except ImportError:
     from models import model_cache
+
+import whisperx
+from faster_whisper import WhisperModel
 
 from pipeline.metadata import (
     config_str,

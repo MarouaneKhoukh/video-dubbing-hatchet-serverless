@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
+import tempfile
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
@@ -36,6 +38,50 @@ def configure_data_root(root: Path) -> None:
     """Default filesystem root for artifact I/O (container ``/data`` mount)."""
     global _default_data_root
     _default_data_root = root.resolve()
+
+
+def auto_configure_data_root() -> bool:
+    """If ``/data`` exists (container has the bucket FUSE-mounted), point storage
+    helpers at it so manifest/report I/O goes through the filesystem rather than
+    the S3 client. Returns True when applied, False on host machines without /data.
+    Safe to call multiple times; idempotent.
+    """
+    mount = Path("/data")
+    if mount.is_dir():
+        configure_data_root(mount)
+        return True
+    return False
+
+
+@contextmanager
+def staged_write(final_path: Path) -> Generator[Path, None, None]:
+    """Write to a seekable local tmp file, then move to ``final_path`` on success.
+
+    Object-storage FUSE mounts at ``/data`` don't support seeking, but ffmpeg
+    (WAV RIFF header, MP4 moov atom) and soundfile (RIFF size field) need
+    seek-back to finalize file headers. Writing direct to ``/data/...`` fails
+    with cryptic non-zero exit codes. Workaround: stage in /tmp (local disk,
+    seekable), then atomic move into the bucket once the writer is done.
+
+    No-op when ``final_path`` is not under ``/data`` (local mode) — writes
+    straight there. Cleans up the tmp file/dir on success and on exception.
+    """
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    needs_staging = (
+        final_path.is_absolute() and len(final_path.parts) > 1 and final_path.parts[1] == "data"
+    )
+    if not needs_staging:
+        yield final_path
+        return
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="dub-stage-"))
+    tmp_path = tmp_dir / final_path.name
+    try:
+        yield tmp_path
+        # Writer succeeded — copy the finalized file into the bucket.
+        shutil.copyfile(tmp_path, final_path)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def _effective_local_root() -> Path | None:
@@ -79,11 +125,6 @@ def output_keys(key_fn: OutputKeyFn[T], item: T) -> list[str]:
     return [keys] if isinstance(keys, str) else list(keys)
 
 
-def item_outputs_exist(item: T, output_key_fn: OutputKeyFn[T]) -> bool:
-    """True when every expected artifact for *item* is present in the bucket."""
-    return all(object_exists(key) for key in output_keys(output_key_fn, item))
-
-
 def _s3_client():
     return boto3.client(
         "s3",
@@ -99,20 +140,13 @@ def _bucket_name() -> str:
     return require_cloud_setting("NEBIUS_BUCKET_NAME", secrets.nebius_bucket_name)
 
 
-def download_from_storage(object_key: str, local_path: Path) -> None:
-    local_path.parent.mkdir(parents=True, exist_ok=True)
-    bucket = _bucket_name()
-    logger.info(f"Downloading s3://{bucket}/{object_key} → {local_path}")
-    _s3_client().download_file(bucket, object_key, str(local_path))
-
-
 def upload_to_storage(local_path: Path, object_key: str) -> None:
     bucket = _bucket_name()
     logger.info(f"Uploading {local_path} → s3://{bucket}/{object_key}")
     _s3_client().upload_file(str(local_path), bucket, object_key)
 
 
-def upload_bytes(data: bytes, object_key: str, content_type: str = "application/octet-stream") -> None:
+def _upload_bytes(data: bytes, object_key: str, content_type: str = "application/octet-stream") -> None:
     """Upload raw bytes (e.g. a JSON manifest) directly without writing a temp file."""
     local = _local_path(object_key)
     if local is not None:
@@ -131,7 +165,7 @@ def upload_bytes(data: bytes, object_key: str, content_type: str = "application/
 
 
 def upload_json(payload: dict, object_key: str) -> None:
-    upload_bytes(json.dumps(payload, ensure_ascii=False).encode("utf-8"), object_key, "application/json")
+    _upload_bytes(json.dumps(payload, ensure_ascii=False).encode("utf-8"), object_key, "application/json")
 
 
 def read_json(object_key: str) -> dict[str, Any] | None:
@@ -192,14 +226,3 @@ def list_objects(prefix: str) -> list[str]:
     return keys
 
 
-def unprocessed_items(
-    items: Iterable[T],
-    output_key_fn: OutputKeyFn[T],
-) -> list[T]:
-    """Return items whose output artifact(s) do not yet exist in S3.
-
-    Resume is bucket-only: no in-memory or Hatchet task output is consulted.
-    Re-trigger or retry with the same ``video_keys`` + ``run_id``; each task
-    recomputes paths and skips files whose outputs already exist.
-    """
-    return [item for item in items if not item_outputs_exist(item, output_key_fn)]

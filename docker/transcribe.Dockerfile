@@ -28,6 +28,8 @@ ENV PYTHONPATH=/ \
     MODEL_CACHE_DIR=/data/models \
     HF_HOME=/data/models/huggingface \
     HUGGINGFACE_HUB_CACHE=/data/models/huggingface/hub \
-    TORCH_HOME=/data/models/torch
+    TORCH_HOME=/data/models/torch \
+    HF_HUB_DISABLE_XET=1 \
+    HF_HUB_DISABLE_SYMLINKS_WARNING=1
 
 ENTRYPOINT ["python3", "-m", "jobs.transcribe"]

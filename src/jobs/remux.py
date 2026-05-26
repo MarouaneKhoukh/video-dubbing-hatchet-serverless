@@ -22,21 +22,43 @@ from pipeline.metadata import (
     video_keys_by_stem,
 )
 from pipeline.paths import build_run_items_from_stems
-from pipeline.storage import data_root
+from pipeline.storage import auto_configure_data_root, data_root, staged_write
 from pipeline.utils import utc_now
+
+# Wire the /data FUSE mount into pipeline.storage so manifest reads use the
+# bucket directly instead of an S3 client (no AWS creds inside the container).
+auto_configure_data_root()
 
 
 def _ffmpeg_remux(video_path: Path, dubbed_path: Path, output_path: Path) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        "ffmpeg",
-        "-i", str(video_path),
-        "-i", str(dubbed_path),
-        "-map", "0:v:0", "-map", "1:a:0",
-        "-c:v", "copy", "-c:a", "aac", "-shortest",
-        "-y", str(output_path),
-    ]
-    subprocess.run(cmd, check=True, capture_output=True)
+    # Kokoro emits 24 kHz mono WAV with channel_layout="unknown", which makes
+    # some players (notably QuickTime / Apple Preview / VSCode preview) skip
+    # the audio track silently after remux. Fix with an explicit filter chain:
+    #   - aformat=channel_layouts=mono   → stamp the input as proper mono
+    #   - pan=stereo|c0=c0|c1=c0         → duplicate mono into both channels
+    #   - aresample=48000                → resample to standard 48 kHz
+    # Then encode as AAC LC at 128 kbps — the universal MP4 audio baseline.
+    # Stage the MP4 in /tmp because the moov atom needs seek-back finalization,
+    # and FUSE-mounted /data can't seek.
+    with staged_write(output_path) as out_path:
+        cmd = [
+            "ffmpeg",
+            "-i", str(video_path),
+            "-i", str(dubbed_path),
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-c:v", "copy",
+            "-af", "aformat=channel_layouts=mono,pan=stereo|c0=c0|c1=c0,aresample=48000",
+            "-c:a", "aac", "-profile:a", "aac_low", "-b:a", "128k",
+            "-shortest", "-movflags", "+faststart",
+            "-y", str(out_path),
+        ]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(
+                f"ffmpeg remux failed for {video_path.name} "
+                f"(exit {e.returncode}): {e.stderr.strip()[-800:]}"
+            ) from e
 
 
 def _process_file(

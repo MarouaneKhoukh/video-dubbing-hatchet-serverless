@@ -9,14 +9,18 @@ Invocation:
 import time
 from pathlib import Path
 
-import numpy as np
-import soundfile as sf
-from kokoro import KPipeline
-
+# IMPORTANT: import model_cache BEFORE kokoro/soundfile/numpy. kokoro
+# transitively imports huggingface_hub, which captures HF_HUB_DISABLE_XET at
+# its own module-import time. model_cache sets that env var at *its* module
+# top, so it must be imported first to take effect.
 try:
     import model_cache
 except ImportError:
     from models import model_cache
+
+import numpy as np
+import soundfile as sf
+from kokoro import KPipeline
 
 from pipeline.metadata import (
     config_str,
@@ -29,7 +33,7 @@ from pipeline.metadata import (
     resolve_manifest_stems,
 )
 from pipeline.paths import build_run_items_from_stems
-from pipeline.storage import data_root
+from pipeline.storage import data_root, staged_write
 from pipeline.utils import utc_now
 
 model_cache.configure()
@@ -82,8 +86,9 @@ def _synthesize_one(
         raise RuntimeError(f"No audio generated for {input_path.name} — check input text")
 
     combined = np.concatenate(audio_chunks)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    sf.write(str(output_path), combined, 24000)
+    # Stage WAV write in /tmp (seekable) — FUSE-mounted /data can't seek.
+    with staged_write(output_path) as out_path:
+        sf.write(str(out_path), combined, 24000)
     return True
 
 

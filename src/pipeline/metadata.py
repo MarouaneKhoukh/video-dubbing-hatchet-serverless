@@ -10,13 +10,18 @@ from typing import TYPE_CHECKING, Any, Literal
 from pydantic import BaseModel
 
 from pipeline.config import config
+from pipeline.cost import estimate_cost, on_demand_estimate
 from pipeline.paths import (
     RUNS_PREFIX,
+    run_summary_key,
+    task_chunk_manifest_container_path,
+    task_chunk_manifest_key,
     task_manifest_container_path,
-    task_manifest_object_key,
-    task_report_object_key,
+    task_manifest_key,
+    task_orch_report_key,
+    task_report_key,
 )
-from pipeline.storage import list_objects, read_json, upload_json
+from pipeline.storage import list_objects, object_exists, read_json, upload_json
 from pipeline.utils import utc_now
 
 if TYPE_CHECKING:
@@ -45,7 +50,7 @@ _UPSTREAM: dict[str, tuple[str, str, str]] = {
 }
 
 
-class TaskManifest(BaseModel):
+class _TaskManifest(BaseModel):
     """Config snapshot written before a stage runs."""
 
     task: str
@@ -58,10 +63,12 @@ class TaskManifest(BaseModel):
     executor: str | None = None
     config: dict[str, Any]
     video_keys: list[str] | None = None  # only populated for extract; downstream stages derive inputs from upstream reports
+    stems: list[str] | None = None  # chunk-scoped input filter for downstream stages; None = use full upstream report
+    chunk_index: int | None = None  # set when this manifest describes one chunk of a fan-out
 
 
 def read_task_report(run_id: str, task: str) -> dict[str, Any] | None:
-    return read_json(task_report_object_key(run_id, task))
+    return read_json(task_report_key(run_id, task))
 
 
 def _stems_from_report(run_id: str, upstream_task: str, output_key: str) -> list[str] | None:
@@ -107,7 +114,15 @@ def resolve_upstream_stems(run_id: str, stage: str) -> list[str]:
 
 
 def resolve_manifest_stems(manifest: dict[str, Any]) -> list[str]:
-    """Like ``resolve_upstream_stems`` but raises when inputs are missing."""
+    """Like ``resolve_upstream_stems`` but raises when inputs are missing.
+
+    Chunk manifests carry an explicit ``stems`` filter — when present, it scopes
+    the container to that chunk's subset. Non-chunk manifests fall back to the
+    full upstream report.
+    """
+    chunk_stems = manifest.get("stems")
+    if chunk_stems:
+        return list(chunk_stems)
     task = manifest["task"]
     run_id = manifest["run_id"]
     stems = resolve_upstream_stems(run_id, task)
@@ -211,14 +226,7 @@ def video_keys_by_stem(run_id: str) -> dict[str, str]:
     return dict(zip(stems, video_keys, strict=True))
 
 
-def upstream_stage_name(stage: str) -> str | None:
-    if stage == "extract":
-        return None
-    entry = _UPSTREAM.get(stage)
-    return entry[0] if entry else None
-
-
-def resolve_task_device(task: str) -> str:
+def _resolve_task_device(task: str) -> str:
     """Runtime device for a task manifest (``cpu`` / ``cuda``)."""
     if task in ("extract", "remux"):
         return "cpu"
@@ -241,7 +249,7 @@ def _task_config(task: str, *, cli_overrides: dict[str, dict[str, Any]] | None =
     cfg = task_settings[task].model_dump()
     overrides = (cli_overrides or {}).get(task, {})
     cfg.update({key: value for key, value in overrides.items() if key != "device"})
-    cfg["device"] = overrides["device"] if "device" in overrides else resolve_task_device(task)
+    cfg["device"] = overrides["device"] if "device" in overrides else _resolve_task_device(task)
     return cfg
 
 
@@ -258,8 +266,8 @@ def build_task_manifest(
     *,
     cli_overrides: dict[str, dict[str, Any]] | None = None,
     executor: str | None = None,
-) -> TaskManifest:
-    return TaskManifest(
+) -> _TaskManifest:
+    return _TaskManifest(
         task=task,
         run_id=run.run_id,
         batch_id=run.batch_id,
@@ -287,8 +295,148 @@ def write_task_manifest(
         cli_overrides=cli_overrides,
         executor=executor,
     )
-    upload_json(manifest.model_dump(), task_manifest_object_key(run.run_id, task))
+    upload_json(manifest.model_dump(), task_manifest_key(run.run_id, task))
     return task_manifest_container_path(run.run_id, task)
+
+
+def write_task_chunk_manifest(
+    run: PipelineRun,
+    task: str,
+    chunk_index: int,
+    *,
+    video_keys: list[str] | None = None,
+    stems: list[str] | None = None,
+    cli_overrides: dict[str, dict[str, Any]] | None = None,
+    executor: str | None = None,
+) -> str:
+    """Write a chunk-scoped manifest; return container path under ``/data``.
+
+    ``video_keys`` scopes extract chunks; ``stems`` scopes downstream stage chunks
+    (transcribe/translate/tts/remux). Exactly one should be set for the relevant stage.
+    """
+    base = build_task_manifest(
+        run,
+        task,
+        cli_overrides=cli_overrides,
+        executor=executor,
+    )
+    manifest = base.model_copy(
+        update={
+            "chunk_index": chunk_index,
+            "input_count": len(video_keys) if video_keys is not None else (len(stems) if stems is not None else base.input_count),
+            "video_keys": list(video_keys) if video_keys is not None else (list(run.video_keys) if task == "extract" else None),
+            "stems": list(stems) if stems is not None else None,
+        }
+    )
+    upload_json(manifest.model_dump(), task_chunk_manifest_key(run.run_id, task, chunk_index))
+    return task_chunk_manifest_container_path(run.run_id, task, chunk_index)
+
+
+# ── Orchestrator-side reporting (Nebius job records + cost) ──────────────────
+
+
+def _job_run_s(record: dict[str, Any]) -> float:
+    """Seconds between first ``RUNNING`` observation and the terminal observation.
+
+    Returns 0 when the timeline never reached RUNNING (e.g. cancelled in QUEUED).
+    """
+    transitions = record.get("state_transitions") or []
+    running_at = None
+    terminal_at = None
+    for t in transitions:
+        state = t.get("state")
+        ts = t.get("observed_at_s")
+        if running_at is None and state == "RUNNING":
+            running_at = ts
+        if state in ("COMPLETED", "FAILED", "CANCELLED", "ERROR"):
+            terminal_at = ts
+    if running_at is None or terminal_at is None or terminal_at < running_at:
+        return 0.0
+    return float(terminal_at - running_at)
+
+
+def _job_cost_usd(record: dict[str, Any]) -> float:
+    return estimate_cost(
+        platform=record.get("platform", ""),
+        preset=record.get("preset", ""),
+        preemptible=bool(record.get("preemptible", False)),
+        run_s=_job_run_s(record),
+    )
+
+
+def _job_on_demand_usd(record: dict[str, Any]) -> float:
+    return on_demand_estimate(
+        platform=record.get("platform", ""),
+        preset=record.get("preset", ""),
+        run_s=_job_run_s(record),
+    )
+
+
+def write_task_orchestration_report(
+    run_id: str,
+    task: str,
+    *,
+    jobs: list[dict[str, Any]],
+    chunk_count: int,
+) -> dict[str, Any]:
+    """Persist per-chunk Nebius job records for one stage + the cost rollup."""
+    enriched: list[dict[str, Any]] = []
+    for j in jobs:
+        run_s = _job_run_s(j)
+        enriched.append({
+            **j,
+            "run_s": round(run_s, 2),
+            "estimated_usd": round(_job_cost_usd(j), 4),
+        })
+    cost_usd = round(sum(_job_cost_usd(j) for j in jobs), 4)
+    on_demand_usd = round(sum(_job_on_demand_usd(j) for j in jobs), 4)
+    payload = {
+        "task": task,
+        "run_id": run_id,
+        "completed_at": utc_now(),
+        "chunk_count": chunk_count,
+        "cost_usd": cost_usd,
+        "cost_if_on_demand_usd": on_demand_usd,
+        "jobs": enriched,
+    }
+    upload_json(payload, task_orch_report_key(run_id, task))
+    return payload
+
+
+def _read_task_orchestration_report(run_id: str, task: str) -> dict[str, Any] | None:
+    return read_json(task_orch_report_key(run_id, task))
+
+
+def write_run_summary(run_id: str) -> dict[str, Any]:
+    """Aggregate per-stage orchestration reports into a single run summary."""
+    stages_data: list[dict[str, Any]] = []
+    for task in STAGE_TASKS:
+        report = _read_task_orchestration_report(run_id, task)
+        if report is None:
+            continue
+        stages_data.append({
+            "task": task,
+            "chunk_count": report.get("chunk_count", 0),
+            "cost_usd": report.get("cost_usd", 0.0),
+            "cost_if_on_demand_usd": report.get("cost_if_on_demand_usd", 0.0),
+        })
+
+    total = round(sum(s["cost_usd"] for s in stages_data), 4)
+    on_demand = round(sum(s["cost_if_on_demand_usd"] for s in stages_data), 4)
+    savings = round(on_demand - total, 4)
+    pct = round((savings / on_demand * 100), 1) if on_demand > 0 else 0.0
+
+    payload = {
+        "run_id": run_id,
+        "completed_at": utc_now(),
+        "stages": stages_data,
+        "total_cost_usd": total,
+        "cost_if_on_demand_usd": on_demand,
+        "savings_usd": savings,
+        "savings_pct": pct,
+    }
+    upload_json(payload, run_summary_key(run_id))
+    return payload
 
 
 def _stage_status(result: dict[str, Any], *, failed: bool) -> StageStatus:
@@ -316,12 +464,11 @@ _OUTPUT_FIELDS: dict[str, tuple[str, ...]] = {
 }
 
 
-def expected_output_keys(run: PipelineRun, task: str) -> list[str]:
-    """All artifact object keys this stage is expected to produce for *run*.
+def _items_for(run: PipelineRun, task: str) -> list[dict[str, str]]:
+    """Build per-file item dicts (stem, video_key, output paths) for this stage.
 
-    Used by Hatchet pre-flight to decide whether work is needed: scan upstream
-    report (or ``run.video_keys`` for extract) to derive stems, then build the
-    full output-key list. Returns an empty list when upstream hasn't run.
+    Shared by ``expected_output_keys`` and ``missing_inputs`` so fan-out chunking
+    walks the exact same items the pre-flight scan uses.
     """
     from pipeline.paths import build_run_items, build_run_items_from_stems
 
@@ -329,22 +476,56 @@ def expected_output_keys(run: PipelineRun, task: str) -> list[str]:
         raise ValueError(f"Unknown task {task!r}")
 
     if task == "extract":
-        items = build_run_items(list(run.video_keys), run.run_id)
-    else:
-        stems = resolve_upstream_stems(run.run_id, task)
-        if not stems:
-            return []
-        items = build_run_items_from_stems(
-            stems,
-            run.run_id,
-            video_keys_by_stem=video_keys_by_stem(run.run_id) if task == "remux" else None,
-        )
+        return build_run_items(list(run.video_keys), run.run_id)
+    stems = resolve_upstream_stems(run.run_id, task)
+    if not stems:
+        return []
+    return build_run_items_from_stems(
+        stems,
+        run.run_id,
+        video_keys_by_stem=video_keys_by_stem(run.run_id) if task == "remux" else None,
+    )
 
+
+def expected_output_keys(run: PipelineRun, task: str) -> list[str]:
+    """All artifact object keys this stage is expected to produce for *run*.
+
+    Used by Hatchet pre-flight to decide whether work is needed: scan upstream
+    report (or ``run.video_keys`` for extract) to derive stems, then build the
+    full output-key list. Returns an empty list when upstream hasn't run.
+    """
+    items = _items_for(run, task)
     keys: list[str] = []
     for item in items:
         for field in _OUTPUT_FIELDS[task]:
             keys.append(item[field])
     return keys
+
+
+def missing_inputs(run: PipelineRun, task: str) -> dict[str, list[str]]:
+    """Inputs that still need processing for *task* — outputs not yet in S3.
+
+    Returns ``{"video_keys": [...], "stems": []}`` for extract, or
+    ``{"video_keys": [], "stems": [...]}`` for downstream stages. Empty values
+    on both keys mean nothing to do.
+    """
+    items = _items_for(run, task)
+    output_fields = _OUTPUT_FIELDS[task]
+
+    if task == "extract":
+        video_keys = [
+            item["video_key"]
+            for item in items
+            if any(not object_exists(item[f]) for f in output_fields)
+        ]
+        return {"video_keys": video_keys, "stems": []}
+
+    stems = [
+        item["stem"]
+        for item in items
+        if any(not object_exists(item[f]) for f in output_fields)
+    ]
+    return {"video_keys": [], "stems": stems}
 
 
 def write_skipped_report(run: PipelineRun, task: str, expected: list[str]) -> dict[str, Any]:
@@ -386,7 +567,7 @@ def write_skipped_report(run: PipelineRun, task: str, expected: list[str]) -> di
         "per_file_s": 0.0,
     }
     result["timing"] = timing
-    write_task_report(run.run_id, run.batch_id, task, result, started_at=started)
+    _write_task_report(run.run_id, run.batch_id, task, result, started_at=started)
     return result
 
 
@@ -413,7 +594,7 @@ def record_task_result(
     error: str | None = None,
 ) -> None:
     """Convenience: pull run_id/batch_id/task from a manifest dict and write the report."""
-    write_task_report(
+    _write_task_report(
         config["run_id"],
         config["batch_id"],
         config["task"],
@@ -424,7 +605,7 @@ def record_task_result(
     )
 
 
-def write_task_report(
+def _write_task_report(
     run_id: str,
     batch_id: str,
     task: str,
@@ -439,7 +620,7 @@ def write_task_report(
     outputs = {key: value for key, value in result.items() if key != "timing"}
     status = _stage_status(result, failed=failed)
 
-    manifest_key = task_manifest_object_key(run_id, task)
+    manifest_key = task_manifest_key(run_id, task)
     manifest = read_json(manifest_key)
     device = manifest.get("config", {}).get("device") if manifest else None
 
@@ -457,4 +638,4 @@ def write_task_report(
         "outputs": outputs,
         "error": error,
     }
-    upload_json(report, task_report_object_key(run_id, task))
+    upload_json(report, task_report_key(run_id, task))

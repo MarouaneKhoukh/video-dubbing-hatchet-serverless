@@ -18,17 +18,16 @@ from pathlib import Path
 
 import typer
 from rich.panel import Panel
-from rich.table import Table
 
 from pipeline.config import get_config
 from pipeline.paths import (
     repo_data_dir,
     resolve_video_keys,
-    task_manifest_object_key,
+    task_manifest_key,
 )
 from pipeline.run import STAGE_ORDER, PipelineRun, run_pipeline, run_stage
 from pipeline.storage import use_local_artifacts
-from pipeline.utils import get_console, setup_logging
+from pipeline.utils import get_console, print_run_summary, setup_logging
 
 app = typer.Typer(
     name="pipeline",
@@ -51,31 +50,17 @@ def _print_summary(
     stages: list[str],
     device: str,
 ) -> None:
-    console = get_console()
-    mode = "single" if len(video_keys) == 1 else f"batch ({len(video_keys)} files)"
-
-    table = Table(show_header=False, box=None, padding=(0, 1))
-    table.add_column(style="dim")
-    table.add_column()
-    table.add_row("Mode", mode)
-    table.add_row("Executor", "python (in-process)")
-    table.add_row("Data dir", str(data_dir))
-    table.add_row("Language", run.target_lang)
-    table.add_row("Run ID", run.run_id)
-    table.add_row("Stages", ", ".join(stages))
-    table.add_row("Force", str(run.force))
-    table.add_row("Transcribe device", device)
-    table.add_row("Output prefix", f"runs/{run.run_id}/")
-
-    if len(video_keys) <= 10:
-        for vk in video_keys:
-            table.add_row("Input", vk)
-    else:
-        for vk in video_keys[:5]:
-            table.add_row("Input", vk)
-        table.add_row("", f"… and {len(video_keys) - 5} more")
-
-    console.print(Panel(table, title="Local pipeline run", border_style="green"))
+    print_run_summary(
+        run, video_keys,
+        title="Local pipeline run",
+        border_style="green",
+        extra_rows=[
+            ("Executor", "python (in-process)"),
+            ("Data dir", str(data_dir)),
+            ("Stages", ", ".join(stages)),
+            ("Transcribe device", device),
+        ],
+    )
 
 
 @app.command("run")
@@ -234,7 +219,7 @@ def cmd_prepare_manifest(
         manifest = build_task_manifest(
             run_input, stage, cli_overrides=cli_overrides, executor="docker"
         )
-        key = task_manifest_object_key(run_id, stage)
+        key = task_manifest_key(run_id, stage)
         upload_json(manifest.model_dump(), key)
 
     get_console().print(

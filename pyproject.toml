@@ -55,6 +55,11 @@ tts = [
     "kokoro==0.9.4",
     "soundfile==0.13.1",
     "numpy==2.2.5",
+    # spacy (pulled in by kokoro → misaki) imports click at module load via
+    # spacy/cli/__init__.py — even when we never call the CLI. uv sometimes
+    # doesn't materialize it into the tts image's venv (see .dev/talk.md bug #8).
+    # Pinning it directly is the bulletproof fix.
+    "click>=8.0",
 ]
 
 [[tool.uv.index]]
