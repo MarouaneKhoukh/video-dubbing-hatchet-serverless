@@ -1,0 +1,84 @@
+[project]
+name = "video-dubbing-hatchet-serverless"
+version = "0.1.0"
+description = "Serverless video dubbing pipeline with Hatchet and Nebius"
+requires-python = ">=3.11"
+
+# Hatchet worker + local dev (not installed in Nebius job images)
+dependencies = [
+    "hatchet-sdk>=0.41.0",
+    "nebius>=0.2.0",
+    "boto3>=1.34.0",
+    "transformers>=4.40.0",
+    "accelerate>=0.29.0",
+    "sentencepiece>=0.2.0",
+    "torch>=2.2.0",
+    "moviepy>=1.0.3",
+    "requests>=2.31.0",
+    "pydantic-settings>=2.2.0",
+    "python-dotenv>=1.0.0",
+    "typer>=0.15.0",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+# Sample data download: python scripts/download_samples.py nasa --sample-size 10
+# Install: uv pip install -e ".[download]"
+download = [
+    "datasets>=2.19.0",
+    "huggingface_hub>=0.23.0",
+]
+
+# Pinned deps for Nebius container images (installed via `uv sync --group <name>`).
+[dependency-groups]
+# CPU torch + torchaudio (PyPI) — local Mac / no-GPU Docker via docker/base-cpu.Dockerfile
+cpu-base = [
+    "torch==2.5.1",
+    "torchaudio==2.5.1",
+]
+# CUDA torch (cu124 index) — Nebius / Linux+NVIDIA via docker/base-cuda.Dockerfile
+cuda-base = [
+    "torch==2.5.1",
+]
+transcribe = [
+    "faster-whisper==1.1.0",
+    "whisperx==3.3.1",
+    "matplotlib>=3.8.0",
+]
+translate = [
+    "transformers==4.51.3",
+    "sentencepiece==0.2.0",
+    "accelerate==1.6.0",
+    "protobuf==5.29.4",
+]
+tts = [
+    "kokoro==0.9.4",
+    "soundfile==0.13.1",
+    "numpy==2.2.5",
+    # spacy (pulled in by kokoro → misaki) imports click at module load via
+    # spacy/cli/__init__.py — even when we never call the CLI. uv sometimes
+    # doesn't materialize it into the tts image's venv (see .dev/talk.md bug #8).
+    # Pinning it directly is the bulletproof fix.
+    "click>=8.0",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+# cu124 only for the cuda-base group; cpu-base and task groups resolve torch from PyPI
+torch = { index = "pytorch-cu124", group = "cuda-base" }
+
+[tool.uv]
+conflicts = [
+    [{ group = "cpu-base" }, { group = "cuda-base" }],
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pipeline", "src/jobs", "src/hatchet", "src/models"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
